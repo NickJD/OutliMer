@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools", "wheel",]
+requires = ["setuptools", "wheel", ]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,11 +8,11 @@ version = "0.1.0"
 authors = [
     {name = "Nicholas Dimonaco", email = "nicholas@dimonaco.co.uk"}
 ]
-description = "OutliMer - A [meta]genomic sample outlier detection system."
+description = "OutliMer - A a tool to detect outlier samples using k-mers and hashes."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
-keywords = ["Sequence Data", "Hashing", "Outlier Detection", "Metagenomics"]
+keywords = ["Genome annotation", "Gene Prediction"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
@@ -27,6 +27,7 @@ Homepage = "https://github.com/NickJD/OutliMer"
 "Bug Tracker" = "https://github.com/NickJD/OutliMer/issues"
 
 [project.scripts]
+    OutliMer = "OutliMer.OutliMer:main"
 
 
 

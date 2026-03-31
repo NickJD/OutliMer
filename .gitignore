@@ -205,3 +205,15 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+src/.DS_Store
+
+src/OutliMer/.DS_Store
+
+src/OutliMer/kmer_outputs/.DS_Store
+
+src/OutliMer/kmer_outputs_OLD/.DS_Store
+
+src/OutliMer/kmer_outputs_OLD/export_kmers/.DS_Store
+
+.DS_Store

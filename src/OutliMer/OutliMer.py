@@ -1,0 +1,1628 @@
+"""
+OutliMer.py  –  Identify outlier samples via sourmash k-mer MinHash sketching.
+
+Fixes applied vs original
+─────────────────────────
+BUGS
+  B1  Missing argparse definitions for --pair, --output, --report,
+      --shared-summary, --write-db-each, and all --outlier-* flags.
+  B2  Dead second `if hasattr(mh, "hashes")` branch in both build_minhash
+      functions was unreachable; removed.
+  B3  export_top_union CSV block was indented inside the per-sample debug loop
+      so the file was rewritten on every iteration; moved outside the loop.
+  B4  `globals()` used to test a local variable (sourmash_seq_map); replaced
+      with a direct reference.
+  B5  find_examples_for_hashes called with empty r2 path for single-end
+      samples, which would crash open(); guarded.
+  B6  Dead `if not line: break` in fasta_sequences removed (file iteration
+      never yields an empty string).
+  B7  Always-true `'report_rows' in locals()` guard removed.
+
+REDUNDANCIES
+  R1  Duplicate MinHash hash-extraction logic extracted into _extract_hash_counts().
+  R2  Extension lists unified into module-level EXTENSIONS_MAP constant.
+  R3  Double "dropped singles" log message deduplicated.
+  R4  `top_n` recomputed in three separate places; now computed once early in main.
+  R5  Redundant seq.strip() in find_examples_for_hashes removed
+      (fastq_sequences already strips).
+  R6  total_counts aggregation computed once via _compute_total_counts() and reused.
+
+DESIGN / STRUCTURAL
+  D1  builtins.print monkey-patch removed; logging.Logger used throughout.
+  D2  main() decomposed: process_samples(), _run_exports(), _detect_outliers(),
+      generate_plots(), and build_arg_parser() are now separate functions.
+  D3  --input-substring changed from required=True to optional (default None).
+  D4  Silent `except Exception: pass` blocks replaced with logger.debug() calls.
+  D5  Pervasive hasattr(args,...) guards replaced with argparse-declared defaults.
+
+OPTIMISATIONS
+  O1  compare_sample_to_db uses set intersection (len(a & b)) instead of a loop.
+  O2  Pairwise Jaccard heatmap computes only the upper triangle then mirrors.
+  O3  find_examples_for_hashes breaks the inner k-mer loop early when all
+      target hashes have been found.
+  O4  Sample sketching parallelised with ThreadPoolExecutor (sourmash releases
+      the GIL during its C-level hashing, so threads provide real concurrency).
+"""
+
+import argparse
+import concurrent.futures
+import csv
+import gzip
+import logging
+import os
+import re
+import sys
+from collections import defaultdict
+from typing import Dict, Iterator, List, Optional, Set, Tuple
+
+import matplotlib
+try:
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import numpy as np
+except Exception:
+    plt = None
+    np = None
+
+try:
+    import sourmash
+    from sourmash import MinHash
+except Exception:
+    sourmash = None
+    MinHash = None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module-level constants  (R2: replaces duplicated inline dicts)
+# ─────────────────────────────────────────────────────────────────────────────
+
+FASTQ_EXTENSIONS: List[str] = ['.fastq', '.fq', '.fastq.gz', '.fq.gz']
+FASTA_EXTENSIONS: List[str] = ['.fa', '.fasta', '.fna', '.fa.gz', '.fasta.gz']
+
+EXTENSIONS_MAP: Dict[str, List[str]] = {
+    'paired-fastq': FASTQ_EXTENSIONS,
+    'single-fastq': FASTQ_EXTENSIONS,
+    'fasta': FASTA_EXTENSIONS,
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# I/O helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def open_maybe_gz(path: str):
+    """Open a plain or gzip-compressed text file for reading."""
+    if path.endswith('.gz'):
+        return gzip.open(path, 'rt', errors='replace')
+    return open(path, 'r', errors='replace')
+
+
+def fastq_sequences(path: str) -> Iterator[str]:
+    """Yield sequence strings from a FASTQ file (plain or gzipped)."""
+    with open_maybe_gz(path) as fh:
+        while True:
+            header = fh.readline()
+            if not header:
+                break
+            seq = fh.readline()
+            if not seq:
+                break
+            fh.readline()   # '+'
+            fh.readline()   # quality
+            yield seq.strip()
+
+
+def fasta_sequences(path: str) -> Iterator[str]:
+    """Yield sequence strings from a FASTA file (plain or gzipped).
+
+    B6: removed the dead `if not line: break` guard – iterating a file object
+    never yields an empty string; the loop simply ends at EOF.
+    """
+    with open_maybe_gz(path) as fh:
+        seq_lines: List[str] = []
+        for line in fh:
+            line = line.rstrip('\n')
+            if not line:
+                continue
+            if line.startswith('>'):
+                if seq_lines:
+                    yield ''.join(seq_lines)
+                    seq_lines = []
+                continue
+            seq_lines.append(line.strip())
+        if seq_lines:
+            yield ''.join(seq_lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# K-mer utilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+def revcomp(seq: str) -> str:
+    trans = str.maketrans('ACGTacgt', 'TGCAtgca')
+    return seq.translate(trans)[::-1]
+
+
+def canonical_kmer(kmer: str) -> str:
+    """Return the lexicographically smaller of kmer and its reverse complement."""
+    rc = revcomp(kmer)
+    return kmer if kmer <= rc else rc
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MinHash helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_hash_counts(mh: 'MinHash') -> Dict[int, int]:
+    """Extract {hash: abundance} from a sourmash MinHash object.
+
+    R1: consolidated from duplicated logic in build_minhash_for_pair and
+    build_minhash_for_single.
+    B2: the dead second `if hasattr(mh, "hashes")` fallback is removed;
+    if the first attempt raises, we try get_mins/get_abundance, then raise.
+    """
+    if hasattr(mh, 'hashes'):
+        try:
+            return {int(k): int(v) for k, v in mh.hashes.items()}
+        except Exception as exc:
+            logging.getLogger('OutliMer').debug(
+                'mh.hashes dict access failed: %s', exc)
+
+    if hasattr(mh, 'get_mins') and hasattr(mh, 'get_abundance'):
+        try:
+            return {int(h): int(mh.get_abundance(h)) for h in mh.get_mins()}
+        except Exception as exc:
+            logging.getLogger('OutliMer').debug(
+                'get_mins/get_abundance failed: %s', exc)
+
+    raise RuntimeError(
+        'Could not extract hash counts from MinHash object. '
+        'Check sourmash version compatibility.')
+
+
+def _sketch_sample(
+    name: str,
+    r1: str,
+    r2: str,
+    ksize: int,
+    scaled: int,
+    is_fasta: bool,
+) -> Tuple[str, Optional[Dict[int, int]], Optional[str]]:
+    """Build a MinHash sketch for one sample.  Returns (name, counts, error).
+
+    Designed to run inside a ThreadPoolExecutor (O4).
+    sourmash releases the GIL during its C-level murmur hashing so threads
+    provide genuine concurrency here.
+    """
+    if sourmash is None:
+        return name, None, 'sourmash not installed'
+    try:
+        mh = MinHash(ksize=ksize, n=0, scaled=scaled, track_abundance=True)
+        if r2:
+            for seq in fastq_sequences(r1):
+                mh.add_sequence(seq, force=True)
+            for seq in fastq_sequences(r2):
+                mh.add_sequence(seq, force=True)
+        else:
+            seq_iter = fasta_sequences if is_fasta else fastq_sequences
+            for seq in seq_iter(r1):
+                mh.add_sequence(seq, force=True)
+        return name, _extract_hash_counts(mh), None
+    except Exception as exc:
+        return name, None, str(exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sample discovery
+# ─────────────────────────────────────────────────────────────────────────────
+
+def gather_samples_from_dir(
+    input_dir: str,
+    input_type: str = 'paired-fastq',
+    substring: Optional[str] = None,
+) -> List[Tuple[str, str, str]]:
+    """Scan *input_dir* and return [(sample_name, r1, r2)] tuples.
+
+    R2: uses the module-level EXTENSIONS_MAP instead of a locally-redefined dict.
+    For single-fastq and fasta types, r2 is always ''.
+    """
+    allowed_exts = EXTENSIONS_MAP.get(input_type, FASTQ_EXTENSIONS)
+
+    entries: List[str] = []
+    for fn in os.listdir(input_dir):
+        if substring and substring not in fn:
+            continue
+        fp = os.path.join(input_dir, fn)
+        if not os.path.isfile(fp):
+            continue
+        if any(fn.lower().endswith(ext) for ext in allowed_exts):
+            entries.append(fn)
+
+    if input_type == 'paired-fastq':
+        pairs_map: Dict[str, Dict[str, str]] = {}
+        for fn in entries:
+            stem = fn
+            for ext in ['.fastq.gz', '.fq.gz', '.fastq', '.fq']:
+                if stem.lower().endswith(ext):
+                    stem = stem[:-len(ext)]
+                    break
+            read: Optional[str] = None
+            prefix: Optional[str] = None
+            tokens = ['_R1', '_R2', '_r1', '_r2', '_1', '_2',
+                      '.R1', '.R2', '.r1', '.r2']
+            for tok in tokens:
+                pos = stem.rfind(tok)
+                if pos != -1:
+                    prefix = stem[:pos]
+                    read = '1' if '1' in tok else '2'
+                    break
+            if prefix is None:
+                m = re.match(r'(?i)(?P<prefix>.*?)[._-](?P<read>[12])(?:$|[._-])',
+                             stem)
+                if m:
+                    prefix = m.group('prefix')
+                    read = m.group('read')
+            if prefix is None:
+                prefix = stem
+            fullpath = os.path.join(input_dir, fn)
+            rec = pairs_map.setdefault(prefix, {})
+            if read == '1':
+                rec['1'] = fullpath
+            elif read == '2':
+                rec['2'] = fullpath
+            else:
+                rec.setdefault('singles', []).append(fullpath)
+
+        out: List[Tuple[str, str, str]] = []
+        for pfx, rec in pairs_map.items():
+            if '1' in rec and '2' in rec:
+                out.append((pfx, rec['1'], rec['2']))
+            else:
+                for i, s in enumerate(rec.get('singles', [])):
+                    out.append((f'{pfx}_single{i + 1}', s, ''))
+        return out
+
+    # single-fastq or fasta
+    out = []
+    for fn in entries:
+        stem = fn
+        for ext in allowed_exts:
+            if stem.lower().endswith(ext):
+                stem = stem[:-len(ext)]
+                break
+        out.append((stem, os.path.join(input_dir, fn), ''))
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSV writers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def write_wide_csv(
+    sample_hash_counts: Dict[str, Dict[int, int]],
+    out_path: str,
+) -> None:
+    all_hashes = sorted({h for c in sample_hash_counts.values() for h in c})
+    samples = sorted(sample_hash_counts)
+    with open(out_path, 'w', newline='') as fh:
+        writer = csv.writer(fh)
+        writer.writerow(['hash'] + samples)
+        for h in all_hashes:
+            writer.writerow([h] + [sample_hash_counts[s].get(h, 0) for s in samples])
+
+
+def write_wide_csv_with_seq(
+    sample_hash_counts: Dict[str, Dict[int, int]],
+    out_path: str,
+    seq_map: Dict[int, List[Tuple[str, str]]],
+) -> None:
+    all_hashes = sorted({h for c in sample_hash_counts.values() for h in c})
+    samples = sorted(sample_hash_counts)
+    with open(out_path, 'w', newline='') as fh:
+        writer = csv.writer(fh)
+        writer.writerow(['hash', 'sequence'] + samples)
+        for h in all_hashes:
+            seqs = seq_map.get(h, [])
+            seq_field = ';'.join(k for _, k in seqs)
+            writer.writerow([h, seq_field] + [sample_hash_counts[s].get(h, 0)
+                                               for s in samples])
+
+
+def write_long_csv(
+    sample_hash_counts: Dict[str, Dict[int, int]],
+    out_path: str,
+) -> None:
+    with open(out_path, 'w', newline='') as fh:
+        writer = csv.writer(fh)
+        writer.writerow(['sample', 'hash', 'count'])
+        for sample in sorted(sample_hash_counts):
+            for h, c in sample_hash_counts[sample].items():
+                if c:
+                    writer.writerow([sample, h, c])
+
+
+def write_long_csv_with_seq(
+    sample_hash_counts: Dict[str, Dict[int, int]],
+    out_path: str,
+    seq_map: Dict[int, List[Tuple[str, str]]],
+) -> None:
+    with open(out_path, 'w', newline='') as fh:
+        writer = csv.writer(fh)
+        writer.writerow(['sample', 'hash', 'sequence', 'count'])
+        for sample in sorted(sample_hash_counts):
+            for h, c in sample_hash_counts[sample].items():
+                if c:
+                    seqs = seq_map.get(h, [])
+                    seq_field = ';'.join(k for _, k in seqs)
+                    writer.writerow([sample, h, seq_field, c])
+
+
+def write_union_summary(
+    sample_hash_counts: Dict[str, Dict[int, int]],
+    out_dir: Optional[str],
+    seq_map: Optional[Dict[int, List[Tuple[str, str]]]] = None,
+    filename: str = 'top_union_summary.csv',
+) -> str:
+    """Write a union summary CSV of all hashes across all samples."""
+    if not sample_hash_counts:
+        raise RuntimeError('No sample hash counts available')
+    export_dir = os.path.join(out_dir or '.', 'export_kmers')
+    os.makedirs(export_dir, exist_ok=True)
+    out_path = os.path.join(export_dir, filename)
+    all_hashes = sorted({int(h) for c in sample_hash_counts.values()
+                          for h in c})
+    samples = sorted(sample_hash_counts)
+    include_seq = bool(seq_map)
+    header = ['hash'] + (['sequence'] if include_seq else []) + samples
+    with open(out_path, 'w', newline='') as fh:
+        writer = csv.writer(fh)
+        writer.writerow(header)
+        for h in all_hashes:
+            row: list = [h]
+            if include_seq:
+                seqs = seq_map.get(h, [])  # type: ignore[union-attr]
+                row.append(seqs[0][1] if seqs else '')
+            for s in samples:
+                row.append(int(sample_hash_counts[s].get(h, 0)))
+            writer.writerow(row)
+    return out_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hash database
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_hash_db(path: str) -> Set[int]:
+    result: Set[int] = set()
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    with open_maybe_gz(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                result.add(int(line))
+            except ValueError:
+                continue
+    return result
+
+
+def save_hash_db(path: str, hashes: Set[int]) -> None:
+    open_fn = gzip.open if path.endswith('.gz') else open
+    mode = 'wt' if path.endswith('.gz') else 'w'
+    with open_fn(path, mode) as fh:  # type: ignore[call-overload]
+        for h in sorted(hashes):
+            fh.write(str(h) + '\n')
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Comparison
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compare_sample_to_db(
+    sample_hashes: Set[int],
+    db_hashes: Set[int],
+) -> Tuple[int, int, float]:
+    """Return (n_in_db, n_total, fraction_in_db).
+
+    O1: uses set intersection instead of an explicit loop.
+    """
+    n_total = len(sample_hashes)
+    if n_total == 0:
+        return 0, 0, 0.0
+    n_in = len(sample_hashes & db_hashes)
+    return n_in, n_total, n_in / n_total
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# K-mer example finder
+# ─────────────────────────────────────────────────────────────────────────────
+
+def find_examples_for_hashes(
+    sample: str,
+    r1: str,
+    r2: str,
+    target_hashes: Set[int],
+    ksize: int,
+    per_hash: int = 1,
+) -> Dict[int, List[Tuple[str, str]]]:
+    """Scan paired FASTQ for canonical k-mers that map to *target_hashes*.
+
+    B5: guarded against empty r2.
+    O3: inner k-mer loop breaks early once all target hashes are satisfied.
+    R5: seq.strip() removed – fastq_sequences already strips.
+    """
+    out: Dict[int, List[Tuple[str, str]]] = {}
+    if not target_hashes or not r1:
+        return out
+    try:
+        import sourmash.minhash as sm
+        seed = sm.get_minhash_default_seed()
+        max_hash = sm.get_minhash_max_hash()
+    except Exception as exc:
+        logging.getLogger('OutliMer').debug(
+            'Could not import sourmash.minhash: %s', exc)
+        return out
+
+    def _h(kmer: str) -> int:
+        return int(sm.hash_murmur(kmer, seed)) & max_hash
+
+    remaining = set(target_hashes)
+
+    def _scan(seq_iter: Iterator[str]) -> None:
+        for seq in seq_iter:
+            L = len(seq)
+            if L < ksize:
+                continue
+            for i in range(L - ksize + 1):
+                kmer = seq[i:i + ksize]
+                if 'N' in kmer or 'n' in kmer:
+                    continue
+                kcanon = canonical_kmer(kmer)
+                h = _h(kcanon)
+                if h in target_hashes:
+                    lst = out.setdefault(h, [])
+                    if len(lst) < per_hash:
+                        lst.append((sample, kcanon))
+                        if len(lst) >= per_hash:
+                            remaining.discard(h)
+                # O3: break inner loop as soon as all hashes are found
+                if not remaining:
+                    return
+            if not remaining:
+                return
+
+    _scan(fastq_sequences(r1))
+    if remaining and r2:  # B5: only scan r2 when it is a real path
+        _scan(fastq_sequences(r2))
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared computation helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_kmer_to_samples(
+    sample_hash_counts: Dict[str, Dict[int, int]],
+    exported_items_per_sample: Dict[str, List[Tuple[int, int]]],
+    export_mode: str,
+) -> Dict[int, Dict[str, int]]:
+    """Build hash -> {sample: count} mapping.
+
+    R6: centralised so the same aggregation is not repeated in multiple places.
+    """
+    kmer_to_samples: Dict[int, Dict[str, int]] = defaultdict(dict)
+    if export_mode == 'full':
+        for sample, counts in sample_hash_counts.items():
+            for h, c in counts.items():
+                kmer_to_samples[int(h)][sample] = int(c)
+    else:
+        for sample, items in exported_items_per_sample.items():
+            for h, c in items:
+                kmer_to_samples[int(h)][sample] = int(c)
+    return kmer_to_samples
+
+
+def _compute_total_counts(
+    sample_hash_counts: Dict[str, Dict[int, int]],
+) -> Dict[int, int]:
+    """Sum hash abundances across all samples.
+
+    R6: computed once and reused wherever a global total is needed.
+    """
+    total: Dict[int, int] = {}
+    for counts in sample_hash_counts.values():
+        for h, c in counts.items():
+            total[int(h)] = total.get(int(h), 0) + int(c)
+    return total
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sample processing (D2: extracted from main)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def process_samples(
+    pairs: List[Tuple[str, str, str]],
+    ksize: int,
+    scaled: int,
+    input_type: str,
+    collect_sequences: bool,
+    top_per_sample: int,
+    profile_samples: Set[str],
+    profile_dir: Optional[str],
+    profile_force_recompute: bool,
+    profile_agg_counts: Dict[int, int],
+    profile_update: bool,
+    profile_name: Optional[str],
+    threads: int,
+    logger: logging.Logger,
+) -> Tuple[
+    Dict[str, Dict[int, int]],   # sample_hash_counts
+    Dict[str, Tuple[str, str]],  # sample_files
+    Dict[int, List[Tuple[str, str]]],  # sourmash_seq_map
+    Dict[int, int],              # updated profile_agg_counts
+    Set[str],                    # updated profile_samples
+]:
+    """Sketch all samples in parallel and collect sequence mappings.
+
+    O4: uses ThreadPoolExecutor so multiple samples are sketched concurrently.
+    D4: exception details are now logged rather than silently swallowed.
+    """
+    is_fasta = input_type == 'fasta'
+    sample_hash_counts: Dict[str, Dict[int, int]] = {}
+    sample_files: Dict[str, Tuple[str, str]] = {}
+    sourmash_seq_map: Dict[int, List[Tuple[str, str]]] = {}
+
+    # Determine which samples need sketching
+    to_sketch: List[Tuple[str, str, str]] = []
+    for name, r1, r2 in pairs:
+        if (profile_dir and name in profile_samples
+                and not profile_force_recompute):
+            logger.info('Skipping %s (already in profile)', name)
+            continue
+        to_sketch.append((name, r1, r2))
+
+    logger.info('Sketching %d sample(s) with %d thread(s) …', len(to_sketch),
+                threads)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
+        futures = {
+            pool.submit(_sketch_sample, name, r1, r2, ksize, scaled, is_fasta):
+                (name, r1, r2)
+            for name, r1, r2 in to_sketch
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            name, r1, r2 = futures[fut]
+            sketch_name, counts, error = fut.result()
+            if error or counts is None:
+                logger.warning('Failed to process sample %s: %s', name, error)
+                continue
+            sample_hash_counts[name] = counts
+            sample_files[name] = (r1, r2)
+
+            total_count = sum(counts.values())
+            logger.info('DONE %s: unique_hashes=%d total_count=%d',
+                        name, len(counts), total_count)
+
+            # Profile matching stats
+            if profile_agg_counts:
+                n_in = sum(1 for h in counts if int(h) in profile_agg_counts)
+                frac = n_in / len(counts) if counts else 0.0
+                logger.info('  %s: %d/%d hashes in profile (frac=%.4f)',
+                            name, n_in, len(counts), frac)
+
+            # Profile update
+            if profile_update and profile_name:
+                for h, c in counts.items():
+                    profile_agg_counts[int(h)] = (
+                        profile_agg_counts.get(int(h), 0) + int(c))
+                profile_samples.add(name)
+
+            # Optional per-sample sequence collection
+            if collect_sequences and counts:
+                top_n = top_per_sample if top_per_sample > 0 else None
+                items = sorted(counts.items(), key=lambda x: -x[1])
+                targets = {h for h, _ in (items[:top_n] if top_n else items)}
+                if targets:
+                    try:
+                        found = find_examples_for_hashes(
+                            name, r1, r2, targets, ksize, per_hash=1)
+                        for h, lst in found.items():
+                            cur = sourmash_seq_map.setdefault(int(h), [])
+                            if not cur and lst:
+                                cur.append(lst[0])
+                    except Exception as exc:
+                        logger.debug('Sequence mapping failed for %s: %s',
+                                     name, exc)
+
+    return (sample_hash_counts, sample_files, sourmash_seq_map,
+            profile_agg_counts, profile_samples)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-sample file exports (D2: extracted from main)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _write_per_sample_top_n(
+    sample: str,
+    items: List[Tuple[int, int]],
+    kmer_to_samples: Dict[int, Dict[str, int]],
+    sourmash_seq_map: Dict[int, List[Tuple[str, str]]],
+    seq_enabled: bool,
+    outdir: str,
+    top_n: Optional[int],
+    fill_unique: bool,
+    logger: logging.Logger,
+) -> None:
+    """Write {sample}_topN.csv, _unique_hashes.csv, _shared_hashes.csv."""
+    unique_rows: List[tuple] = []
+    shared_rows: List[tuple] = []
+    for h, cnt in items:
+        owners = kmer_to_samples.get(int(h), {})
+        seq = ''
+        if seq_enabled:
+            seqs = sourmash_seq_map.get(int(h), [])
+            seq = seqs[0][1] if seqs else ''
+        is_unique = len(owners) == 1 and sample in owners
+        other = ';'.join(f'{s}:{c}' for s, c in sorted(owners.items())
+                         if s != sample)
+        if is_unique:
+            unique_rows.append((int(h), seq, int(cnt)))
+        else:
+            shared_rows.append((int(h), seq, int(cnt), other))
+
+    # topN file
+    samp_topN = os.path.join(outdir, f'{sample}_topN.csv')
+    with open(samp_topN, 'w', newline='') as fh:
+        writer = csv.writer(fh)
+        if seq_enabled:
+            writer.writerow(['hash', 'sequence', 'count', 'is_unique',
+                             'other_samples_counts'])
+            for h, seq, cnt in unique_rows:
+                owners = kmer_to_samples.get(h, {})
+                other = ';'.join(f'{s}:{c}' for s, c in sorted(owners.items())
+                                 if s != sample)
+                writer.writerow([h, seq, cnt, 'yes', ''])
+            for h, seq, cnt, other in shared_rows:
+                writer.writerow([h, seq, cnt, 'no', other])
+        else:
+            writer.writerow(['hash', 'count', 'is_unique',
+                             'other_samples_counts'])
+            for h, seq, cnt in unique_rows:
+                owners = kmer_to_samples.get(h, {})
+                other = ';'.join(f'{s}:{c}' for s, c in sorted(owners.items())
+                                 if s != sample)
+                writer.writerow([h, cnt, 'yes', ''])
+            for h, seq, cnt, other in shared_rows:
+                writer.writerow([h, cnt, 'no', other])
+    logger.debug('Wrote %s (%d rows)', samp_topN, len(items))
+
+    # unique / shared files
+    unique_file = os.path.join(outdir, f'{sample}_unique_hashes.csv')
+    shared_file = os.path.join(outdir, f'{sample}_shared_hashes.csv')
+    with open(unique_file, 'w', newline='') as uf, \
+         open(shared_file, 'w', newline='') as sf:
+        uw = csv.writer(uf)
+        sw = csv.writer(sf)
+        if seq_enabled:
+            uw.writerow(['hash', 'sequence', 'count'])
+            sw.writerow(['hash', 'sequence', 'count', 'other_samples_counts'])
+        else:
+            uw.writerow(['hash', 'count'])
+            sw.writerow(['hash', 'count', 'other_samples_counts'])
+        n_u = n_s = 0
+        for h, seq, cnt in unique_rows:
+            if top_n is None or n_u < top_n:
+                uw.writerow([h, seq, cnt] if seq_enabled else [h, cnt])
+                n_u += 1
+        for h, seq, cnt, other in shared_rows:
+            if top_n is None or n_s < top_n:
+                sw.writerow([h, seq, cnt, other] if seq_enabled
+                            else [h, cnt, other])
+                n_s += 1
+    logger.debug('Wrote %s (unique=%d) %s (shared=%d)',
+                 unique_file, n_u, shared_file, n_s)
+
+    # optional filled-unique file
+    if fill_unique and top_n is not None:
+        filled_file = os.path.join(outdir, f'{sample}_unique_hashes_filled.csv')
+        with open(filled_file, 'w', newline='') as ff:
+            fw = csv.writer(ff)
+            if seq_enabled:
+                fw.writerow(['hash', 'sequence', 'count', 'is_unique',
+                             'other_samples_counts'])
+            else:
+                fw.writerow(['hash', 'count', 'is_unique',
+                             'other_samples_counts'])
+            written = 0
+            for h, seq, cnt in unique_rows:
+                if written >= top_n:
+                    break
+                fw.writerow([h, seq, cnt, 'yes', ''] if seq_enabled
+                            else [h, cnt, 'yes', ''])
+                written += 1
+            for h, seq, cnt, other in shared_rows:
+                if written >= top_n:
+                    break
+                fw.writerow([h, seq, cnt, 'no', other] if seq_enabled
+                            else [h, cnt, 'no', other])
+                written += 1
+        logger.debug('Wrote filled unique file %s (%d rows)', filled_file,
+                     written)
+
+
+def _run_exports(
+    args: argparse.Namespace,
+    sample_hash_counts: Dict[str, Dict[int, int]],
+    sample_files: Dict[str, Tuple[str, str]],
+    sourmash_seq_map: Dict[int, List[Tuple[str, str]]],
+    top_n: Optional[int],
+    logger: logging.Logger,
+) -> None:
+    """Write per-sample CSV exports.  D2: extracted from main."""
+    outdir = args.export_kmers_dir
+    os.makedirs(outdir, exist_ok=True)
+    export_mode = args.export_mode
+    seq_enabled = args.collect_sequences or args.export_sequences
+
+    # Build top-N exported items per sample
+    exported_items: Dict[str, List[Tuple[int, int]]] = {}
+    for sample, counts in sample_hash_counts.items():
+        items = sorted(counts.items(), key=lambda x: -x[1])
+        if top_n and top_n > 0:
+            if len(items) < top_n:
+                logger.debug(
+                    'Sample %s: MinHash has only %d hashes (requested %d)',
+                    sample, len(items), top_n)
+            items = items[:top_n]
+        exported_items[sample] = items
+
+    # B3 / R6: compute kmer_to_samples once here (was computed again per branch)
+    kmer_to_samples = _build_kmer_to_samples(
+        sample_hash_counts, exported_items, export_mode)
+
+    # Optionally build sequence mappings in parallel
+    if args.collect_sequences:
+        logger.info('Building sequence examples for top-%s hashes …', top_n)
+        samples_to_map = [s for s in exported_items if exported_items[s]]
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=args.map_threads) as pool:
+            futures = {
+                pool.submit(
+                    find_examples_for_hashes, s,
+                    sample_files[s][0], sample_files[s][1],
+                    {h for h, _ in exported_items[s]},
+                    args.ksize, 1,
+                ): s
+                for s in samples_to_map
+            }
+            for fut in concurrent.futures.as_completed(futures):
+                s = futures[fut]
+                try:
+                    found = fut.result()
+                except Exception as exc:
+                    logger.warning('Mapping failed for %s: %s', s, exc)
+                    continue
+                for h, lst in found.items():
+                    cur = sourmash_seq_map.setdefault(int(h), [])
+                    if not cur and lst:
+                        cur.append(lst[0])
+                logger.debug('Mapped %s: %d examples', s, len(found))
+
+    # Optional hash->sequence mapping file
+    if args.map_out:
+        with open(args.map_out, 'w', newline='') as mf:
+            mw = csv.writer(mf)
+            if seq_enabled:
+                mw.writerow(['hash', 'sample', 'sequence'])
+                for h in sorted(sourmash_seq_map):
+                    for samp, seq in sourmash_seq_map[h]:
+                        mw.writerow([h, samp, seq])
+            else:
+                logger.warning('--map-out specified but no sequences collected')
+                mw.writerow(['hash', 'sample'])
+                for h in sorted(sourmash_seq_map):
+                    for samp, _ in sourmash_seq_map[h]:
+                        mw.writerow([h, samp])
+        logger.info('Wrote hash->sequence mapping to %s', args.map_out)
+
+    fast_mode = not seq_enabled
+
+    # ── Per-sample top-N / unique / shared files ──────────────────────────────
+    for sample in sorted(exported_items):
+        _write_per_sample_top_n(
+            sample, exported_items[sample], kmer_to_samples,
+            sourmash_seq_map, seq_enabled, outdir, top_n,
+            args.fill_unique, logger)
+
+    # ── Lightweight global shared summary (fast mode) ─────────────────────────
+    global_shared_path = (args.export_global_shared
+                          or os.path.join(outdir, 'shared_hashes_all.csv'))
+    with open(global_shared_path, 'w', newline='') as gh:
+        gw = csv.writer(gh)
+        gw.writerow(['hash', 'samples_counts', 'n_samples'])
+        n_shared = 0
+        for h, smap in sorted(kmer_to_samples.items(),
+                               key=lambda x: -len(x[1])):
+            if len(smap) <= 1:
+                continue
+            n_shared += 1
+            gw.writerow([h,
+                         ';'.join(f'{s}:{c}' for s, c in sorted(smap.items())),
+                         len(smap)])
+    logger.info('Wrote global shared hashes (%d) to %s', n_shared,
+                global_shared_path)
+
+    if fast_mode:
+        logger.info('Fast mode: skipping heavy sequence-export steps.')
+        out_long = (args.output if args.output.lower().endswith('.csv')
+                    else args.output + '.csv')
+        write_long_csv(sample_hash_counts, out_long)
+        logger.info('Wrote sparse long CSV to %s', out_long)
+        return
+
+    # ── Heavy path: sequence exports ──────────────────────────────────────────
+    if args.export_sequences:
+        logger.info('Exporting canonical k-mer sequences …')
+        for sample in sorted(sample_files):
+            r1, r2 = sample_files[sample]
+            if export_mode == 'full':
+                target_hashes = set(int(h)
+                                    for h in sample_hash_counts.get(sample, {}))
+                counts_map = {int(h): int(c)
+                              for h, c in sample_hash_counts.get(sample, {}).items()}
+            else:
+                exported = exported_items.get(sample, [])
+                target_hashes = {int(h) for h, _ in exported}
+                counts_map = {int(h): int(c) for h, c in exported}
+            if not target_hashes:
+                continue
+            seq_for_hash: Dict[int, str] = {
+                int(h): sourmash_seq_map[int(h)][0][1]
+                for h in target_hashes
+                if sourmash_seq_map.get(int(h))
+            }
+            remaining_hashes = {h for h in target_hashes
+                                 if h not in seq_for_hash}
+            if remaining_hashes:
+                try:
+                    found = find_examples_for_hashes(
+                        sample, r1, r2, remaining_hashes, args.ksize,
+                        per_hash=1)
+                    for h, lst in found.items():
+                        if lst:
+                            seq_for_hash[int(h)] = lst[0][1]
+                except Exception as exc:
+                    logger.debug('Sequence scan failed for %s: %s', sample, exc)
+
+            items_seq = sorted(
+                ((h, counts_map.get(h, 0), seq_for_hash.get(h, ''))
+                 for h in target_hashes),
+                key=lambda x: -x[1])
+            if top_n:
+                items_seq = items_seq[:top_n]
+
+            samp_csv = os.path.join(outdir, f'{sample}_kmers.csv')
+            with open(samp_csv, 'w', newline='') as fh:
+                writer = csv.writer(fh)
+                writer.writerow(['kmer', 'hash', 'count'])
+                for h, cnt, seq in items_seq:
+                    writer.writerow([seq, h, cnt])
+
+            unique_k = os.path.join(outdir, f'{sample}_unique_kmers.csv')
+            shared_k = os.path.join(outdir, f'{sample}_shared_kmers.csv')
+            with open(unique_k, 'w', newline='') as uf, \
+                 open(shared_k, 'w', newline='') as sf:
+                uw = csv.writer(uf)
+                sw = csv.writer(sf)
+                uw.writerow(['kmer', 'hash', 'count'])
+                sw.writerow(['kmer', 'hash', 'count', 'other_samples_counts'])
+                nu = ns = 0
+                for h, cnt, seq in items_seq:
+                    owners = kmer_to_samples.get(h, {})
+                    others = [s for s in sorted(owners) if s != sample]
+                    if not others:
+                        uw.writerow([seq, h, cnt])
+                        nu += 1
+                    else:
+                        sw.writerow([seq, h, cnt,
+                                     ';'.join(f'{s}:{owners[s]}' for s in others)])
+                        ns += 1
+            logger.info('Wrote sequence exports for %s (unique=%d shared=%d)',
+                        sample, nu, ns)
+
+    # B3: export_top_union written once, OUTSIDE any per-sample loop
+    if args.export_top_union:
+        union_path = (args.top_union_summary
+                      or os.path.join(outdir, 'top_union_summary.csv'))
+        # R6: reuse kmer_to_samples already built above
+        total_counts = _compute_total_counts(sample_hash_counts)
+        all_samples = sorted(exported_items)
+        with open(union_path, 'w', newline='') as uf:
+            uw = csv.writer(uf)
+            header = ['hash']
+            if seq_enabled:
+                header.append('sequence')
+            header += ['total_count'] + all_samples
+            uw.writerow(header)
+            for h in sorted(total_counts, key=lambda x: -total_counts[x]):
+                row: list = [h]
+                if seq_enabled:
+                    seqs = sourmash_seq_map.get(h, [])
+                    row.append(seqs[0][1] if seqs else '')
+                row.append(total_counts[h])
+                for s in all_samples:
+                    row.append(sample_hash_counts[s].get(h, 0)
+                               if s in sample_hash_counts else 0)
+                uw.writerow(row)
+        logger.info('Wrote union top-N summary to %s', union_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Outlier detection (D2: extracted from main)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _detect_outliers(
+    args: argparse.Namespace,
+    report_rows: List[Tuple[str, int, int, float, int]],
+    sample_hash_counts: Dict[str, Dict[int, int]],
+    sample_files: Dict[str, Tuple[str, str]],
+    sourmash_seq_map: Dict[int, List[Tuple[str, str]]],
+    db_hashes: Set[int],
+    db_loaded: bool,
+    out_dir: Optional[str],
+    logger: logging.Logger,
+) -> None:
+    """Identify and export hashes unique to outlier samples.  D2."""
+    threshold = args.outlier_threshold
+    outliers = [r[0] for r in report_rows if float(r[3]) <= threshold]
+    outlier_set = set(outliers)
+    logger.info('Outlier samples (pct_in_db <= %.2f): %s', threshold, outliers)
+
+    # hash -> set of samples containing it
+    hash_to_samples: Dict[int, Set[str]] = defaultdict(set)
+    for s, counts in sample_hash_counts.items():
+        for h in counts:
+            hash_to_samples[int(h)].add(s)
+
+    if db_loaded:
+        baseline = set(db_hashes)
+    else:
+        baseline = set()
+        for s, counts in sample_hash_counts.items():
+            if s not in outlier_set:
+                baseline.update(counts)
+
+    outlier_only = [h for h, samples in hash_to_samples.items()
+                    if samples.issubset(outlier_set) and h not in baseline]
+
+    # R6: top-N filter using pre-computed totals
+    if args.outlier_top > 0:
+        total_counts = _compute_total_counts(sample_hash_counts)
+        outlier_only.sort(key=lambda x: -total_counts.get(x, 0))
+        outlier_only = outlier_only[:args.outlier_top]
+
+    outlier_dir = args.outlier_dir or os.path.join(out_dir or '.', 'outliers')
+    os.makedirs(outlier_dir, exist_ok=True)
+
+    hashes_file = os.path.join(outlier_dir, 'outlier_only_hashes.csv')
+    with open(hashes_file, 'w', newline='') as hf:
+        hw = csv.writer(hf)
+        hw.writerow(['hash', 'samples_present'])
+        for h in sorted(outlier_only):
+            hw.writerow([h,
+                         ';'.join(sorted(hash_to_samples.get(h, set())))])
+    logger.info('Wrote outlier-only hashes to %s (%d)', hashes_file,
+                len(outlier_only))
+
+    for s in outliers:
+        s_hashes = set(int(h) for h in sample_hash_counts.get(s, {}))
+        new_vs_baseline = sorted(h for h in s_hashes if h not in baseline)
+        samp_file = os.path.join(outlier_dir, f'{s}_outlier_new_hashes.csv')
+        with open(samp_file, 'w', newline='') as sf:
+            sw = csv.writer(sf)
+            sw.writerow(['hash', 'count'])
+            for h in new_vs_baseline:
+                sw.writerow([h, int(sample_hash_counts[s].get(h, 0))])
+        logger.info('Wrote outlier-new hashes for %s to %s (%d)',
+                    s, samp_file, len(new_vs_baseline))
+
+    if not args.outlier_seq_per_hash:
+        return
+
+    # Collect example sequences for outlier-only hashes
+    seq_map: Dict[int, str] = {}
+    for h in outlier_only:
+        entries = sourmash_seq_map.get(h, [])
+        if entries:
+            seq_map[h] = entries[0][1]
+
+    remaining_hashes = [h for h in outlier_only if h not in seq_map]
+    if remaining_hashes:
+        for s in outliers:
+            r1, r2 = sample_files.get(s, ('', ''))
+            if not r1:
+                continue
+            try:
+                found = find_examples_for_hashes(
+                    s, r1, r2, set(remaining_hashes), args.ksize, per_hash=1)
+                for h, lst in found.items():
+                    if lst:
+                        seq_map[int(h)] = lst[0][1]
+            except Exception as exc:
+                logger.debug('Outlier seq scan failed for %s: %s', s, exc)
+
+    seqs_file = os.path.join(outlier_dir, 'outlier_only_hashes_with_seq.csv')
+    with open(seqs_file, 'w', newline='') as sf:
+        sw = csv.writer(sf)
+        sw.writerow(['hash', 'sequence', 'samples_present'])
+        for h in sorted(outlier_only):
+            sw.writerow([h, seq_map.get(h, ''),
+                         ';'.join(sorted(hash_to_samples.get(h, set())))])
+    logger.info('Wrote outlier hashes + sequences to %s', seqs_file)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plotting (D2: moved to module level from nested-inside-main)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_plots(
+    report_rows: List[Tuple[str, int, int, float, int]],
+    sample_hash_counts: Dict[str, Dict[int, int]],
+    plot_prefix: str,
+    db_loaded: bool,
+    logger: logging.Logger,
+) -> None:
+    """Generate shared/unique stacked bar, Jaccard heatmap, and fraction histogram."""
+    if plt is None or np is None:
+        logger.warning('matplotlib/numpy not available; cannot generate plots')
+        return
+
+    samples = [r[0] for r in report_rows]
+    n_hashes = np.array([r[1] for r in report_rows])
+    n_in = np.array([r[2] for r in report_rows])
+    n_new = np.array([r[4] for r in report_rows])
+    pct = np.array([r[3] for r in report_rows])
+
+    # 1) Stacked bar
+    fig, ax = plt.subplots(figsize=(max(6, int(len(samples) * 0.6)), 6))
+    ax.bar(samples, n_in, label='shared (in DB/other)')
+    ax.bar(samples, n_new, bottom=n_in, label='unique (not in DB/other)')
+    ax.set_ylabel('Number of unique hashes')
+    ax.set_title('Shared vs Unique hashes per sample')
+    ax.legend()
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    out1 = f'{plot_prefix}_shared_unique_per_sample.png'
+    fig.savefig(out1, dpi=150)
+    plt.close(fig)
+
+    # 2) Pairwise Jaccard heatmap – O2: upper-triangle only, then mirror
+    S = len(samples)
+    jmat = np.zeros((S, S), dtype=float)
+    imat = np.zeros((S, S), dtype=int)
+    hash_sets = [set(sample_hash_counts[s].keys()) for s in samples]
+    for i in range(S):
+        jmat[i, i] = 1.0
+        imat[i, i] = len(hash_sets[i])
+        for j in range(i + 1, S):
+            inter = len(hash_sets[i] & hash_sets[j])
+            union = len(hash_sets[i] | hash_sets[j])
+            val = inter / union if union > 0 else 0.0
+            jmat[i, j] = jmat[j, i] = val
+            imat[i, j] = imat[j, i] = inter
+    fig, ax = plt.subplots(figsize=(8, 6))
+    c = ax.imshow(jmat, cmap='viridis', vmin=0, vmax=1)
+    ax.set_xticks(np.arange(S))
+    ax.set_yticks(np.arange(S))
+    ax.set_xticklabels(samples, rotation=45, ha='right')
+    ax.set_yticklabels(samples)
+    ax.set_title('Pairwise Jaccard similarity (hashed k-mers)')
+    fig.colorbar(c, ax=ax, label='Jaccard')
+    for i in range(S):
+        for j in range(S):
+            ax.text(j, i, str(imat[i, j]), ha='center', va='center',
+                    color='w' if jmat[i, j] < 0.5 else 'black', fontsize=8)
+    plt.tight_layout()
+    out2 = f'{plot_prefix}_pairwise_jaccard.png'
+    fig.savefig(out2, dpi=150)
+    plt.close(fig)
+
+    # 3) Histogram
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.hist(pct, bins=min(20, max(4, len(pct))), color='tab:blue', edgecolor='k')
+    ax.set_xlabel('Fraction of sample hashes present in DB/other')
+    ax.set_ylabel('Number of samples')
+    ax.set_title('Distribution of fraction shared')
+    plt.tight_layout()
+    out3 = f'{plot_prefix}_pct_shared_hist.png'
+    fig.savefig(out3, dpi=150)
+    plt.close(fig)
+
+    label = 'DB' if db_loaded else 'other samples'
+    logger.info('Plots written (compared to %s): %s, %s, %s',
+                label, out1, out2, out3)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Argument parser (D2: extracted from main)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build and return the CLI argument parser.
+
+    B1: all previously missing arguments (--pair, --output, --report,
+    --shared-summary, --write-db-each, and all --outlier-* flags) are now
+    properly registered.
+    D3: --input-substring changed from required=True to optional.
+    D5: explicit defaults mean hasattr(args,...) guards are no longer needed.
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            'Kmerise un/paired FASTQ/FASTA files with sourmash and output '
+            'per-sample hashed k-mer counts as CSV, identifying outlier samples.'
+        )
+    )
+
+    # ── Required ──────────────────────────────────────────────────────────────
+    req = parser.add_argument_group('Required parameters')
+    req.add_argument('--input-dir', required=True,
+                     help='Directory containing input files')
+    req.add_argument('--input-type',
+                     choices=['paired-fastq', 'single-fastq', 'fasta'],
+                     default='paired-fastq', required=True,
+                     help='Type of files in --input-dir (default: paired-fastq)')
+    req.add_argument('--out-dir', required=True,
+                     help='Directory for all output files')
+
+    # D3: no longer required=True
+    req.add_argument('--input-substring', default=None,
+                     help='Only filenames containing this substring are considered')
+
+    # B1: --pair was used throughout main but never registered
+    req.add_argument('--pair', nargs=3, action='append',
+                     metavar=('NAME', 'R1', 'R2'), default=None,
+                     help='Explicit sample triple (may be repeated)')
+
+    # ── Sketching ─────────────────────────────────────────────────────────────
+    sketch = parser.add_argument_group('Sketching parameters')
+    sketch.add_argument('--ksize', type=int, default=31,
+                        help='k-mer size (default: 31)')
+    sketch.add_argument('--scaled', type=int, default=10000,
+                        help='sourmash scaled parameter (default: 10000)')
+
+    # ── Output files ──────────────────────────────────────────────────────────
+    out_grp = parser.add_argument_group('Output file paths')
+    # B1: --output was used but never registered
+    out_grp.add_argument('--output', default='kmer_counts.csv',
+                         help='Path for main CSV output (default: kmer_counts.csv)')
+    # B1: --report was used but never registered
+    out_grp.add_argument('--report', default=None,
+                         help='Path for per-sample hash-comparison report CSV')
+    # B1: --shared-summary was used but never registered
+    out_grp.add_argument('--shared-summary', default=None,
+                         dest='shared_summary',
+                         help='Path for top-shared-per-sample summary CSV')
+
+    # ── Export / limits ───────────────────────────────────────────────────────
+    exp = parser.add_argument_group('Export options')
+    exp.add_argument('--top-per-sample', type=int, default=200,
+                     help='Max top k-mers exported per sample (default: 200)')
+    exp.add_argument('--force-top', action='store_true',
+                     help='Force exactly --top-per-sample items even when '
+                          'MinHash contains fewer (slow)')
+    exp.add_argument('--export-unique-shared', action='store_true',
+                     help='Also write per-sample unique/shared files')
+    exp.add_argument('--fill-unique', action='store_true',
+                     help='Pad per-sample unique file to --top-per-sample with '
+                          'shared hashes')
+    exp.add_argument('--top-shared', type=int, default=100,
+                     help='Top shared k-mers per sample (default: 100)')
+    exp.add_argument('--long', action='store_true',
+                     help='Write long/sparse CSV instead of wide matrix')
+    exp.add_argument('--full-exports', action='store_true',
+                     help='Enable heavy per-sample hash/sequence exports')
+
+    # ── Profile / DB ──────────────────────────────────────────────────────────
+    prof = parser.add_argument_group('Profile and DB parameters')
+    prof.add_argument('--profile-load',
+                      help='Path to an existing profile directory')
+    prof.add_argument('--profile-name',
+                      help='Name for this run\'s profile')
+    prof.add_argument('--profile-update', action='store_true',
+                      help='Update (or create) the named profile')
+    prof.add_argument('--profile-force-recompute', action='store_true',
+                      help='Recompute samples already in the loaded profile')
+    prof.add_argument('--incremental', action='store_true',
+                      help='Compare each sample to the DB incrementally')
+    prof.add_argument('--db-in',
+                      help='Existing hash DB (newline-separated ints, optionally .gz)')
+    prof.add_argument('--db-out',
+                      help='Path to write hash DB (.gz for gzip)')
+    prof.add_argument('--update-db', action='store_true',
+                      help='Update the DB with new hashes before writing')
+    # B1: --write-db-each was used at line 823 but never registered
+    prof.add_argument('--write-db-each', action='store_true',
+                      help='Write the DB after processing each sample '
+                           '(only with --incremental)')
+
+    # ── K-mer sequence export ─────────────────────────────────────────────────
+    kmer = parser.add_argument_group('K-mer sequence export (heavy)')
+    kmer.add_argument('--export-kmers-dir',
+                      help='Directory for per-sample k-mer CSVs')
+    kmer.add_argument('--export-global-shared',
+                      help='Filename for global shared k-mers CSV')
+    kmer.add_argument('--export-mode', choices=['full', 'top'], default='full',
+                      help='Base unique/shared on full MinHash or top-N '
+                           '(default: full)')
+    kmer.add_argument('--export-sequences', action='store_true', default=False,
+                      help='Export canonical k-mer sequences (very heavy)')
+    kmer.add_argument('--map-out', default=None,
+                      help='Path for hash->sequence mapping CSV')
+    kmer.add_argument('--collect-sequences', action='store_true', default=False,
+                      help='Collect example k-mer sequences for hashes (slow)')
+    kmer.add_argument('--map-threads', type=int, default=4,
+                      help='Threads for sequence mapping (default: 4)')
+    kmer.add_argument('--global-top', type=int, default=0,
+                      help='Limit wide CSV to top-M global hashes (0 = no limit)')
+    kmer.add_argument('--export-top-union', action='store_true',
+                      help='Write union summary of per-sample top-N hashes')
+    kmer.add_argument('--top-union-summary',
+                      help='Path for top-union summary CSV')
+
+    # ── Plotting ──────────────────────────────────────────────────────────────
+    plot = parser.add_argument_group('Plotting')
+    plot.add_argument('--plot', action='store_true',
+                      help='Generate shared/unique and Jaccard plots')
+    plot.add_argument('--plot-prefix',
+                      help='Prefix for plot filenames')
+
+    # ── Outlier detection ─────────────────────────────────────────────────────
+    outl = parser.add_argument_group('Outlier detection')
+    # B1: all four --outlier-* flags were used but never registered
+    outl.add_argument('--export-outlier-only', action='store_true',
+                      help='Export hashes unique to outlier samples')
+    outl.add_argument('--outlier-threshold', type=float, default=0.5,
+                      help='Samples with pct_in_db <= this are outliers '
+                           '(default: 0.5)')
+    outl.add_argument('--outlier-top', type=int, default=0,
+                      help='Limit outlier-only hashes to top-N by count '
+                           '(0 = no limit)')
+    outl.add_argument('--outlier-dir',
+                      help='Directory for outlier output files')
+    outl.add_argument('--outlier-seq-per-hash', action='store_true',
+                      help='Write example k-mer sequences for outlier hashes')
+
+    # ── Misc ──────────────────────────────────────────────────────────────────
+    misc = parser.add_argument_group('Misc')
+    misc.add_argument('--verbose', '-v', action='store_true',
+                      help='Verbose progress output')
+    misc.add_argument('--threads', type=int, default=4,
+                      help='Threads for parallel sample sketching (default: 4)')
+
+    return parser
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main(argv=None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    if sourmash is None:
+        parser.error('sourmash Python library is required. '
+                     'Install with: pip install sourmash')
+
+    # ── Logging setup ─────────────────────────────────────────────────────────
+    # D1: builtins.print monkey-patch removed; all output goes through the logger
+    logger = logging.getLogger('OutliMer')
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        fmt = logging.Formatter(
+            '%(asctime)s %(levelname)s: %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S')
+        handler.setFormatter(fmt)
+        logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG if args.verbose else logging.INFO)
+
+    # ── Output directory ──────────────────────────────────────────────────────
+    out_dir: str = args.out_dir
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Resolve relative output paths under out_dir
+    def _resolve(path: Optional[str], default_name: str) -> str:
+        if not path:
+            return os.path.join(out_dir, default_name)
+        if not os.path.isabs(path) and not os.path.dirname(path):
+            return os.path.join(out_dir, path)
+        return path
+
+    args.output = _resolve(args.output, 'kmer_counts.csv')
+    if args.report:
+        args.report = _resolve(args.report, 'report.csv')
+    if args.db_out:
+        args.db_out = _resolve(args.db_out, os.path.basename(args.db_out))
+    if args.export_kmers_dir:
+        args.export_kmers_dir = _resolve(args.export_kmers_dir, 'export_kmers')
+    else:
+        args.export_kmers_dir = os.path.join(out_dir, 'export_kmers')
+    if args.map_out:
+        args.map_out = _resolve(args.map_out, os.path.basename(args.map_out))
+    if not args.plot_prefix:
+        args.plot_prefix = os.path.join(out_dir, 'kmer_plots')
+    elif not os.path.isabs(args.plot_prefix) and not os.path.dirname(args.plot_prefix):
+        args.plot_prefix = os.path.join(out_dir, args.plot_prefix)
+
+    # ── Gather samples ────────────────────────────────────────────────────────
+    logger.info('Scanning %s (type=%s, substring=%s)',
+                args.input_dir, args.input_type, args.input_substring)
+    gathered = gather_samples_from_dir(
+        args.input_dir, args.input_type, args.input_substring)
+
+    # Merge programmatically supplied --pair triples
+    pairs: List[Tuple[str, str, str]] = []
+    if args.pair:
+        for entry in args.pair:
+            pairs.append(tuple(entry))  # type: ignore[arg-type]
+    for name, r1, r2 in gathered:
+        pairs.append((name, r1, r2))
+
+    # For paired mode, drop anything without an R2
+    if args.input_type == 'paired-fastq':
+        before = len(pairs)
+        pairs = [t for t in pairs if t[2]]
+        dropped = before - len(pairs)
+        # R3: log once instead of twice
+        logger.info('Paired mode: dropped %d single(s); using %d paired sample(s)',
+                    dropped, len(pairs))
+
+    if not pairs:
+        parser.error('No input samples found. Check --input-dir / --pair.')
+
+    logger.info('GATHERED %d sample(s)', len(pairs))
+    for name, r1, r2 in pairs:
+        if r2:
+            logger.info('  %s: %s + %s', name,
+                        os.path.basename(r1), os.path.basename(r2))
+        else:
+            logger.info('  %s: %s (single)', name, os.path.basename(r1))
+
+    # ── Load DB ───────────────────────────────────────────────────────────────
+    db_hashes: Set[int] = set()
+    db_loaded = False
+    if args.db_in:
+        logger.info('Loading DB from %s …', args.db_in)
+        try:
+            db_hashes = load_hash_db(args.db_in)
+            db_loaded = True
+            logger.info('Loaded %d hashes from DB', len(db_hashes))
+        except Exception as exc:
+            logger.error('Failed to load DB %s: %s', args.db_in, exc)
+
+    # ── Load profile ──────────────────────────────────────────────────────────
+    profile_dir: Optional[str] = None
+    profile_agg_counts: Dict[int, int] = {}
+    profile_samples: Set[str] = set()
+    if args.profile_load:
+        profile_dir = args.profile_load
+        try:
+            db_path = os.path.join(profile_dir, 'db.txt.gz')
+            if not os.path.exists(db_path):
+                db_path = os.path.join(profile_dir, 'db.txt')
+            if os.path.exists(db_path):
+                db_hashes = load_hash_db(db_path)
+                db_loaded = True
+            agg_path = os.path.join(profile_dir, 'agg_counts.csv')
+            if os.path.exists(agg_path):
+                with open(agg_path, 'r', newline='') as af:
+                    for row in csv.reader(af):
+                        if not row:
+                            continue
+                        try:
+                            h, c = int(row[0]), int(row[1])
+                            profile_agg_counts[h] = (
+                                profile_agg_counts.get(h, 0) + c)
+                        except (ValueError, IndexError) as exc:
+                            logger.debug('Skipping bad agg row: %s', exc)
+            samples_path = os.path.join(profile_dir, 'samples.txt')
+            if os.path.exists(samples_path):
+                with open(samples_path) as sf:
+                    for line in sf:
+                        n = line.strip()
+                        if n:
+                            profile_samples.add(n)
+            logger.info('Loaded profile: %d samples, %d agg hashes, db=%s',
+                        len(profile_samples), len(profile_agg_counts), db_loaded)
+        except Exception as exc:
+            logger.error('Failed to load profile from %s: %s', profile_dir, exc)
+
+    # ── R4: compute top_n once ────────────────────────────────────────────────
+    top_n: Optional[int] = (args.top_per_sample
+                             if args.top_per_sample > 0 else None)
+
+    # ── Process samples ───────────────────────────────────────────────────────
+    (sample_hash_counts,
+     sample_files,
+     sourmash_seq_map,
+     profile_agg_counts,
+     profile_samples) = process_samples(
+        pairs=pairs,
+        ksize=args.ksize,
+        scaled=args.scaled,
+        input_type=args.input_type,
+        collect_sequences=args.collect_sequences,
+        top_per_sample=args.top_per_sample,
+        profile_samples=profile_samples,
+        profile_dir=profile_dir,
+        profile_force_recompute=args.profile_force_recompute,
+        profile_agg_counts=profile_agg_counts,
+        profile_update=args.profile_update,
+        profile_name=args.profile_name,
+        threads=args.threads,
+        logger=logger,
+    )
+
+    if not sample_hash_counts:
+        logger.error('No samples were successfully processed.')
+        return 1
+
+    # ── Always write union summary ────────────────────────────────────────────
+    try:
+        seq_map_arg = sourmash_seq_map if sourmash_seq_map else None
+        union_filename = (os.path.basename(args.top_union_summary)
+                          if args.top_union_summary else 'top_union_summary.csv')
+        union_path = write_union_summary(
+            sample_hash_counts, out_dir,
+            seq_map=seq_map_arg, filename=union_filename)
+        logger.info('Wrote union summary to %s', union_path)
+    except Exception as exc:
+        logger.warning('Failed to write union summary: %s', exc)
+
+    # ── Per-sample exports ────────────────────────────────────────────────────
+    if args.export_kmers_dir and args.full_exports:
+        _run_exports(args, sample_hash_counts, sample_files,
+                     sourmash_seq_map, top_n, logger)
+    elif args.export_kmers_dir:
+        logger.info('--export-kmers-dir given but --full-exports not set; '
+                    'skipping heavy exports')
+
+    # ── Build report rows ─────────────────────────────────────────────────────
+    # B7: removed the always-true `'report_rows' in locals()` guard
+    report_rows: List[Tuple[str, int, int, float, int]] = []
+
+    if args.incremental:
+        # In incremental mode, accumulate comparisons as samples are processed
+        for name, _, _ in pairs:
+            if name not in sample_hash_counts:
+                continue
+            sample_hashes = set(sample_hash_counts[name])
+            n_in, n_total, frac = compare_sample_to_db(sample_hashes, db_hashes)
+            report_rows.append((name, n_total, n_in, round(frac, 6),
+                                 n_total - n_in))
+            if args.update_db:
+                db_hashes.update(sample_hashes)
+                db_loaded = True
+            if args.db_out and args.write_db_each:
+                save_hash_db(args.db_out, db_hashes)
+    else:
+        for sample in sorted(sample_hash_counts):
+            sample_hashes = set(sample_hash_counts[sample])
+            if db_loaded:
+                n_in, n_total, frac = compare_sample_to_db(
+                    sample_hashes, db_hashes)
+            else:
+                # Compare against union of all other samples
+                other = set()
+                for s2, counts in sample_hash_counts.items():
+                    if s2 != sample:
+                        other.update(counts)
+                n_in, n_total, frac = compare_sample_to_db(
+                    sample_hashes, other)
+            report_rows.append((sample, n_total, n_in, round(frac, 6),
+                                 n_total - n_in))
+            logger.debug('Report %s: total=%d in_db=%d frac=%.4f new=%d',
+                         sample, n_total, n_in, frac, n_total - n_in)
+
+    # ── Write report ──────────────────────────────────────────────────────────
+    if args.report:
+        with open(args.report, 'w', newline='') as fh:
+            writer = csv.writer(fh)
+            writer.writerow(['sample', 'n_hashes', 'n_in_db',
+                             'pct_in_db', 'n_new_hashes'])
+            for row in report_rows:
+                writer.writerow(row)
+        logger.info('Wrote report to %s', args.report)
+
+    # ── CSV matrix output ─────────────────────────────────────────────────────
+    if args.full_exports:
+        if args.long:
+            out_long = (args.output if args.output.lower().endswith('.csv')
+                        else args.output + '.csv')
+            if sourmash_seq_map:
+                write_long_csv_with_seq(
+                    sample_hash_counts, out_long, sourmash_seq_map)
+            else:
+                write_long_csv(sample_hash_counts, out_long)
+            logger.info('Wrote long CSV to %s', out_long)
+        else:
+            gtop = args.global_top
+            if gtop > 0:
+                # R6: reuse total_counts helper
+                total_counts = _compute_total_counts(sample_hash_counts)
+                top_hashes = [h for h, _ in
+                              sorted(total_counts.items(), key=lambda x: -x[1])[:gtop]]
+                reduced = {s: {h: counts.get(h, 0) for h in top_hashes}
+                           for s, counts in sample_hash_counts.items()}
+                logger.info('Writing wide CSV (top %d global hashes) to %s',
+                            gtop, args.output)
+                if sourmash_seq_map:
+                    write_wide_csv_with_seq(reduced, args.output,
+                                            sourmash_seq_map)
+                else:
+                    write_wide_csv(reduced, args.output)
+            else:
+                logger.info('Writing full wide CSV to %s', args.output)
+                if sourmash_seq_map:
+                    write_wide_csv_with_seq(sample_hash_counts, args.output,
+                                            sourmash_seq_map)
+                else:
+                    write_wide_csv(sample_hash_counts, args.output)
+    else:
+        logger.info('Minimal mode: skipping detailed CSV output '
+                    '(use --full-exports to enable)')
+
+    # ── Outlier detection ─────────────────────────────────────────────────────
+    if args.export_outlier_only:
+        _detect_outliers(
+            args=args,
+            report_rows=report_rows,
+            sample_hash_counts=sample_hash_counts,
+            sample_files=sample_files,
+            sourmash_seq_map=sourmash_seq_map,
+            db_hashes=db_hashes,
+            db_loaded=db_loaded,
+            out_dir=out_dir,
+            logger=logger,
+        )
+
+    # ── Plots ─────────────────────────────────────────────────────────────────
+    if args.plot:
+        generate_plots(report_rows, sample_hash_counts,
+                       args.plot_prefix, db_loaded, logger)
+
+    # ── Save DB ───────────────────────────────────────────────────────────────
+    if args.db_out:
+        if db_loaded and not args.update_db:
+            out_db = db_hashes
+        else:
+            out_db = set(db_hashes)
+            for counts in sample_hash_counts.values():
+                out_db.update(counts)
+        save_hash_db(args.db_out, out_db)
+        logger.info('Wrote DB (%d hashes) to %s', len(out_db), args.db_out)
+
+    # ── Save profile ──────────────────────────────────────────────────────────
+    if args.profile_update and args.profile_name:
+        prof_out_dir = os.path.join(out_dir, args.profile_name)
+        os.makedirs(prof_out_dir, exist_ok=True)
+        save_hash_db(os.path.join(prof_out_dir, 'db.txt.gz'),
+                     set(db_hashes) | set().union(*sample_hash_counts.values()))
+        agg_path = os.path.join(prof_out_dir, 'agg_counts.csv')
+        with open(agg_path, 'w', newline='') as af:
+            aw = csv.writer(af)
+            for h, c in sorted(profile_agg_counts.items()):
+                aw.writerow([h, c])
+        samples_path = os.path.join(prof_out_dir, 'samples.txt')
+        with open(samples_path, 'w') as sf:
+            for n in sorted(profile_samples):
+                sf.write(n + '\n')
+        logger.info('Saved profile "%s" to %s', args.profile_name, prof_out_dir)
+
+    logger.info('Done.')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
