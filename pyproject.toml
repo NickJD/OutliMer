@@ -1,46 +1,82 @@
 [build-system]
-requires = ["setuptools", "wheel", ]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "OutliMer"
 version = "0.1.0"
-authors = [
-    {name = "Nicholas Dimonaco", email = "nicholas@dimonaco.co.uk"}
-]
-description = "OutliMer - A a tool to detect outlier samples using k-mers and hashes."
+description = "OutliMer detects outlier genomic and metagenomic samples from sourmash k-mer hashes."
 readme = "README.md"
 requires-python = ">=3.10"
-license = {file = "LICENSE"}
-keywords = ["Genome annotation", "Gene Prediction"]
+license = "GPL-3.0-only"
+authors = [
+    {name = "Nicholas Dimonaco", email = "nicholas@dimonaco.co.uk"},
+]
+keywords = [
+    "bioinformatics",
+    "genomics",
+    "metagenomics",
+    "k-mers",
+    "sourmash",
+    "outlier detection",
+]
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
     "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 dependencies = [
+    "matplotlib>=3.6",
+    "numpy>=1.23",
+    "pandas>=1.5",
+    "scikit-learn>=1.2",
+    "scipy>=1.9",
+    "seaborn>=0.12",
+    "sourmash>=4.8",
+]
 
+[project.optional-dependencies]
+dev = [
+    "build>=1.0",
+    "pytest>=7.4",
+    "ruff>=0.5",
+    "twine>=4.0",
 ]
 
 [project.urls]
 Homepage = "https://github.com/NickJD/OutliMer"
+Repository = "https://github.com/NickJD/OutliMer"
 "Bug Tracker" = "https://github.com/NickJD/OutliMer/issues"
 
 [project.scripts]
-    OutliMer = "OutliMer.OutliMer:main"
-
-
+outlimer = "OutliMer.OutliMer:main"
+OutliMer = "OutliMer.OutliMer:main"
+outlimer-classify = "OutliMer.classification:main"
+outlimer-profile = "OutliMer.profiles:main"
 
 [tool.setuptools]
-include-package-data = true
+include-package-data = false
 
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["OutliMer*"]
+namespaces = false
 
-[tool.setuptools.package-data]
-OutliMer = [
-]
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
 
+[tool.ruff]
+line-length = 88
+target-version = "py310"
 
-
+[tool.ruff.lint]
+select = ["F"]
+ignore = ["F841"]

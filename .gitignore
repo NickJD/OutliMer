@@ -217,3 +217,14 @@ src/OutliMer/kmer_outputs_OLD/.DS_Store
 src/OutliMer/kmer_outputs_OLD/export_kmers/.DS_Store
 
 .DS_Store
+
+# OutliMer generated outputs
+examples/kmer_outputs/
+examples/kmer_outputs_OLD/
+outlimer_results/
+
+.github/
+
+examples/toy/
+
+packaging/

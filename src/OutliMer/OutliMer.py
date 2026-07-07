@@ -48,21 +48,14 @@ import argparse
 import concurrent.futures
 import csv
 import gzip
+import json
 import logging
 import os
 import re
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Dict, Iterator, List, Optional, Set, Tuple
-
-import matplotlib
-try:
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import numpy as np
-except Exception:
-    plt = None
-    np = None
 
 try:
     import sourmash
@@ -77,11 +70,13 @@ except Exception:
 
 FASTQ_EXTENSIONS: List[str] = ['.fastq', '.fq', '.fastq.gz', '.fq.gz']
 FASTA_EXTENSIONS: List[str] = ['.fa', '.fasta', '.fna', '.fa.gz', '.fasta.gz']
+SIG_EXTENSIONS: List[str] = ['.sig', '.sig.gz']
 
 EXTENSIONS_MAP: Dict[str, List[str]] = {
     'paired-fastq': FASTQ_EXTENSIONS,
     'single-fastq': FASTQ_EXTENSIONS,
     'fasta': FASTA_EXTENSIONS,
+    'signature': SIG_EXTENSIONS,
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -132,6 +127,40 @@ def fasta_sequences(path: str) -> Iterator[str]:
             yield ''.join(seq_lines)
 
 
+def load_sample_metadata(
+    path: str,
+    sample_column: str = 'sample',
+) -> Tuple[Dict[str, Dict[str, str]], List[str]]:
+    """Load sample metadata from CSV/TSV keyed by sample name."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    delimiter = '\t' if path.lower().endswith(('.tsv', '.tab')) else ','
+    with open(path, newline='') as fh:
+        sample_text = fh.read(4096)
+        fh.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample_text, delimiters=',\t')
+            delimiter = dialect.delimiter
+        except csv.Error:
+            pass
+        reader = csv.DictReader(fh, delimiter=delimiter)
+        if not reader.fieldnames:
+            raise ValueError('metadata file has no header row')
+        if sample_column not in reader.fieldnames:
+            raise ValueError(
+                f'metadata sample column {sample_column!r} not found')
+        metadata_columns = [c for c in reader.fieldnames if c != sample_column]
+        metadata: Dict[str, Dict[str, str]] = {}
+        for row in reader:
+            sample = (row.get(sample_column) or '').strip()
+            if not sample:
+                continue
+            metadata[sample] = {
+                c: (row.get(c) or '') for c in metadata_columns
+            }
+    return metadata, metadata_columns
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # K-mer utilities
 # ─────────────────────────────────────────────────────────────────────────────
@@ -178,13 +207,38 @@ def _extract_hash_counts(mh: 'MinHash') -> Dict[int, int]:
         'Check sourmash version compatibility.')
 
 
+def _load_signature_counts(path: str, ksize: int) -> Dict[int, int]:
+    """Load hash counts from the first compatible sourmash signature."""
+    if sourmash is None:
+        raise RuntimeError('sourmash not installed')
+
+    signatures = None
+    if hasattr(sourmash, 'load_file_as_signatures'):
+        signatures = list(sourmash.load_file_as_signatures(path, ksize=ksize))
+    else:
+        from sourmash.signature import load_signatures_from_json
+        with open_maybe_gz(path) as fh:
+            signatures = list(load_signatures_from_json(fh.read(), ksize=ksize))
+
+    for sig in signatures:
+        mh = getattr(sig, 'minhash', None)
+        if mh is None:
+            continue
+        sig_ksize = getattr(mh, 'ksize', ksize)
+        if int(sig_ksize) != int(ksize):
+            continue
+        return _extract_hash_counts(mh)
+
+    raise RuntimeError(f'No DNA signature with ksize={ksize} found in {path}')
+
+
 def _sketch_sample(
     name: str,
     r1: str,
     r2: str,
     ksize: int,
     scaled: int,
-    is_fasta: bool,
+    input_type: str,
 ) -> Tuple[str, Optional[Dict[int, int]], Optional[str]]:
     """Build a MinHash sketch for one sample.  Returns (name, counts, error).
 
@@ -195,6 +249,9 @@ def _sketch_sample(
     if sourmash is None:
         return name, None, 'sourmash not installed'
     try:
+        if input_type == 'signature':
+            return name, _load_signature_counts(r1, ksize), None
+
         mh = MinHash(ksize=ksize, n=0, scaled=scaled, track_abundance=True)
         if r2:
             for seq in fastq_sequences(r1):
@@ -202,7 +259,7 @@ def _sketch_sample(
             for seq in fastq_sequences(r2):
                 mh.add_sequence(seq, force=True)
         else:
-            seq_iter = fasta_sequences if is_fasta else fastq_sequences
+            seq_iter = fasta_sequences if input_type == 'fasta' else fastq_sequences
             for seq in seq_iter(r1):
                 mh.add_sequence(seq, force=True)
         return name, _extract_hash_counts(mh), None
@@ -227,7 +284,7 @@ def gather_samples_from_dir(
     allowed_exts = EXTENSIONS_MAP.get(input_type, FASTQ_EXTENSIONS)
 
     entries: List[str] = []
-    for fn in os.listdir(input_dir):
+    for fn in sorted(os.listdir(input_dir)):
         if substring and substring not in fn:
             continue
         fp = os.path.join(input_dir, fn)
@@ -272,7 +329,7 @@ def gather_samples_from_dir(
                 rec.setdefault('singles', []).append(fullpath)
 
         out: List[Tuple[str, str, str]] = []
-        for pfx, rec in pairs_map.items():
+        for pfx, rec in sorted(pairs_map.items()):
             if '1' in rec and '2' in rec:
                 out.append((pfx, rec['1'], rec['2']))
             else:
@@ -360,13 +417,17 @@ def write_union_summary(
     out_dir: Optional[str],
     seq_map: Optional[Dict[int, List[Tuple[str, str]]]] = None,
     filename: str = 'top_union_summary.csv',
+    out_path: Optional[str] = None,
 ) -> str:
     """Write a union summary CSV of all hashes across all samples."""
     if not sample_hash_counts:
         raise RuntimeError('No sample hash counts available')
-    export_dir = os.path.join(out_dir or '.', 'export_kmers')
-    os.makedirs(export_dir, exist_ok=True)
-    out_path = os.path.join(export_dir, filename)
+    if out_path is None:
+        export_dir = os.path.join(out_dir or '.', 'export_kmers')
+        os.makedirs(export_dir, exist_ok=True)
+        out_path = os.path.join(export_dir, filename)
+    else:
+        os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
     all_hashes = sorted({int(h) for c in sample_hash_counts.values()
                           for h in c})
     samples = sorted(sample_hash_counts)
@@ -537,6 +598,161 @@ def _compute_total_counts(
     return total
 
 
+def _safe_cache_name(sample: str) -> str:
+    return re.sub(r'[^A-Za-z0-9_.-]+', '_', sample).strip('._') or 'sample'
+
+
+def _source_fingerprint(paths: Tuple[str, str]) -> List[Dict[str, int | str]]:
+    fingerprint: List[Dict[str, int | str]] = []
+    for path in paths:
+        if not path:
+            continue
+        stat = os.stat(path)
+        fingerprint.append({
+            'path': os.path.abspath(path),
+            'size': int(stat.st_size),
+            'mtime_ns': int(stat.st_mtime_ns),
+        })
+    return fingerprint
+
+
+def _cache_payload_metadata(
+    sample: str,
+    paths: Tuple[str, str],
+    ksize: int,
+    scaled: int,
+    input_type: str,
+) -> Dict[str, object]:
+    return {
+        'sample': sample,
+        'inputs': _source_fingerprint(paths),
+        'ksize': int(ksize),
+        'scaled': int(scaled),
+        'input_type': input_type,
+        'schema': 1,
+    }
+
+
+def _cache_path(cache_dir: str, sample: str) -> str:
+    return os.path.join(cache_dir, f'{_safe_cache_name(sample)}.json')
+
+
+def _load_cached_counts(
+    cache_dir: Optional[str],
+    sample: str,
+    paths: Tuple[str, str],
+    ksize: int,
+    scaled: int,
+    input_type: str,
+) -> Optional[Dict[int, int]]:
+    if not cache_dir:
+        return None
+    path = _cache_path(cache_dir, sample)
+    if not os.path.exists(path):
+        return None
+    with open(path) as fh:
+        payload = json.load(fh)
+    expected = _cache_payload_metadata(sample, paths, ksize, scaled, input_type)
+    if payload.get('metadata') != expected:
+        return None
+    counts = payload.get('counts', {})
+    return {int(h): int(c) for h, c in counts.items()}
+
+
+def _save_cached_counts(
+    cache_dir: Optional[str],
+    sample: str,
+    paths: Tuple[str, str],
+    ksize: int,
+    scaled: int,
+    input_type: str,
+    counts: Dict[int, int],
+) -> None:
+    if not cache_dir:
+        return
+    os.makedirs(cache_dir, exist_ok=True)
+    payload = {
+        'metadata': _cache_payload_metadata(sample, paths, ksize, scaled, input_type),
+        'counts': {str(int(h)): int(c) for h, c in counts.items()},
+    }
+    with open(_cache_path(cache_dir, sample), 'w') as fh:
+        json.dump(payload, fh, sort_keys=True)
+
+
+def write_multiqc_summary(
+    report_rows: List[Tuple[str, int, int, float, int]],
+    out_dir: str,
+) -> str:
+    """Write MultiQC custom-content JSON for core OutliMer run stats."""
+    payload = {
+        'id': 'outlimer_sample_summary',
+        'section_name': 'OutliMer sample summary',
+        'description': 'OutliMer per-sample hash sharing and novelty metrics.',
+        'plot_type': 'bargraph',
+        'pconfig': {
+            'id': 'outlimer_new_hashes',
+            'title': 'OutliMer novel hashes',
+            'ylab': 'Novel hashes',
+        },
+        'data': {
+            sample: {
+                'n_hashes': int(n_hashes),
+                'n_in_db': int(n_in),
+                'pct_in_db': float(pct),
+                'n_new_hashes': int(n_new),
+            }
+            for sample, n_hashes, n_in, pct, n_new in report_rows
+        },
+    }
+    out_path = os.path.join(out_dir, 'outlimer_summary_mqc.json')
+    with open(out_path, 'w') as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+    return out_path
+
+
+def write_ro_crate_metadata(
+    out_dir: str,
+    inputs: Dict[str, str],
+    outputs: Dict[str, Optional[str]],
+    parameters: Dict[str, object],
+) -> str:
+    """Write minimal RO-Crate metadata for an OutliMer run."""
+    file_entities = []
+    for label, path in {**inputs, **outputs}.items():
+        if not path:
+            continue
+        file_entities.append({
+            '@id': os.path.basename(path),
+            '@type': 'File',
+            'name': label,
+            'contentUrl': path,
+        })
+    crate = {
+        '@context': 'https://w3id.org/ro/crate/1.1/context',
+        '@graph': [
+            {
+                '@id': 'ro-crate-metadata.json',
+                '@type': 'CreativeWork',
+                'conformsTo': {'@id': 'https://w3id.org/ro/crate/1.1'},
+                'about': {'@id': './'},
+            },
+            {
+                '@id': './',
+                '@type': 'Dataset',
+                'name': 'OutliMer run',
+                'dateCreated': datetime.now(timezone.utc).isoformat(),
+                'hasPart': [{'@id': item['@id']} for item in file_entities],
+                'outlimerParameters': parameters,
+            },
+            *file_entities,
+        ],
+    }
+    out_path = os.path.join(out_dir, 'ro-crate-metadata.json')
+    with open(out_path, 'w') as fh:
+        json.dump(crate, fh, indent=2)
+    return out_path
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Sample processing (D2: extracted from main)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -555,6 +771,7 @@ def process_samples(
     profile_update: bool,
     profile_name: Optional[str],
     threads: int,
+    cache_dir: Optional[str],
     logger: logging.Logger,
 ) -> Tuple[
     Dict[str, Dict[int, int]],   # sample_hash_counts
@@ -568,7 +785,6 @@ def process_samples(
     O4: uses ThreadPoolExecutor so multiple samples are sketched concurrently.
     D4: exception details are now logged rather than silently swallowed.
     """
-    is_fasta = input_type == 'fasta'
     sample_hash_counts: Dict[str, Dict[int, int]] = {}
     sample_files: Dict[str, Tuple[str, str]] = {}
     sourmash_seq_map: Dict[int, List[Tuple[str, str]]] = {}
@@ -580,6 +796,39 @@ def process_samples(
                 and not profile_force_recompute):
             logger.info('Skipping %s (already in profile)', name)
             continue
+        try:
+            cached = _load_cached_counts(
+                cache_dir, name, (r1, r2), ksize, scaled, input_type)
+        except Exception as exc:
+            logger.debug('Cache read failed for %s: %s', name, exc)
+            cached = None
+        if cached is not None:
+            sample_hash_counts[name] = cached
+            sample_files[name] = (r1, r2)
+            total_count = sum(cached.values())
+            logger.info('CACHE %s: unique_hashes=%d total_count=%d',
+                        name, len(cached), total_count)
+            if profile_update and profile_name:
+                for h, c in cached.items():
+                    profile_agg_counts[int(h)] = (
+                        profile_agg_counts.get(int(h), 0) + int(c))
+                profile_samples.add(name)
+            if collect_sequences and cached and input_type != 'signature':
+                top_n = top_per_sample if top_per_sample > 0 else None
+                items = sorted(cached.items(), key=lambda x: -x[1])
+                targets = {h for h, _ in (items[:top_n] if top_n else items)}
+                if targets:
+                    try:
+                        found = find_examples_for_hashes(
+                            name, r1, r2, targets, ksize, per_hash=1)
+                        for h, lst in found.items():
+                            cur = sourmash_seq_map.setdefault(int(h), [])
+                            if not cur and lst:
+                                cur.append(lst[0])
+                    except Exception as exc:
+                        logger.debug('Sequence mapping failed for %s: %s',
+                                     name, exc)
+            continue
         to_sketch.append((name, r1, r2))
 
     logger.info('Sketching %d sample(s) with %d thread(s) …', len(to_sketch),
@@ -587,7 +836,7 @@ def process_samples(
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
         futures = {
-            pool.submit(_sketch_sample, name, r1, r2, ksize, scaled, is_fasta):
+            pool.submit(_sketch_sample, name, r1, r2, ksize, scaled, input_type):
                 (name, r1, r2)
             for name, r1, r2 in to_sketch
         }
@@ -599,6 +848,11 @@ def process_samples(
                 continue
             sample_hash_counts[name] = counts
             sample_files[name] = (r1, r2)
+            try:
+                _save_cached_counts(
+                    cache_dir, name, (r1, r2), ksize, scaled, input_type, counts)
+            except Exception as exc:
+                logger.debug('Cache write failed for %s: %s', name, exc)
 
             total_count = sum(counts.values())
             logger.info('DONE %s: unique_hashes=%d total_count=%d',
@@ -652,6 +906,7 @@ def _write_per_sample_top_n(
     outdir: str,
     top_n: Optional[int],
     fill_unique: bool,
+    write_unique_shared: bool,
     logger: logging.Logger,
 ) -> None:
     """Write {sample}_topN.csv, _unique_hashes.csv, _shared_hashes.csv."""
@@ -696,6 +951,9 @@ def _write_per_sample_top_n(
             for h, seq, cnt, other in shared_rows:
                 writer.writerow([h, cnt, 'no', other])
     logger.debug('Wrote %s (%d rows)', samp_topN, len(items))
+
+    if not write_unique_shared:
+        return
 
     # unique / shared files
     unique_file = os.path.join(outdir, f'{sample}_unique_hashes.csv')
@@ -751,6 +1009,37 @@ def _write_per_sample_top_n(
                      written)
 
 
+def _write_shared_summary(
+    exported_items: Dict[str, List[Tuple[int, int]]],
+    kmer_to_samples: Dict[int, Dict[str, int]],
+    out_path: str,
+    top_shared: int,
+) -> None:
+    """Write top shared hashes for each sample."""
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    limit = top_shared if top_shared > 0 else None
+    with open(out_path, 'w', newline='') as fh:
+        writer = csv.writer(fh)
+        writer.writerow([
+            'sample', 'hash', 'count', 'other_samples_counts',
+            'n_other_samples',
+        ])
+        for sample in sorted(exported_items):
+            shared: List[Tuple[int, int, str, int]] = []
+            for h, cnt in exported_items[sample]:
+                owners = kmer_to_samples.get(int(h), {})
+                others = {s: c for s, c in owners.items() if s != sample}
+                if not others:
+                    continue
+                other_field = ';'.join(
+                    f'{s}:{c}' for s, c in sorted(others.items()))
+                shared.append((int(h), int(cnt), other_field, len(others)))
+            shared.sort(key=lambda row: (-row[3], -row[1], row[0]))
+            for h, cnt, other_field, n_other in (
+                    shared[:limit] if limit is not None else shared):
+                writer.writerow([sample, h, cnt, other_field, n_other])
+
+
 def _run_exports(
     args: argparse.Namespace,
     sample_hash_counts: Dict[str, Dict[int, int]],
@@ -771,6 +1060,10 @@ def _run_exports(
         items = sorted(counts.items(), key=lambda x: -x[1])
         if top_n and top_n > 0:
             if len(items) < top_n:
+                if args.force_top:
+                    raise RuntimeError(
+                        f'Sample {sample} has only {len(items)} hashes; '
+                        f'cannot satisfy --force-top {top_n}')
                 logger.debug(
                     'Sample %s: MinHash has only %d hashes (requested %d)',
                     sample, len(items), top_n)
@@ -833,7 +1126,8 @@ def _run_exports(
         _write_per_sample_top_n(
             sample, exported_items[sample], kmer_to_samples,
             sourmash_seq_map, seq_enabled, outdir, top_n,
-            args.fill_unique, logger)
+            args.fill_unique, args.export_unique_shared or args.fill_unique,
+            logger)
 
     # ── Lightweight global shared summary (fast mode) ─────────────────────────
     global_shared_path = (args.export_global_shared
@@ -853,12 +1147,14 @@ def _run_exports(
     logger.info('Wrote global shared hashes (%d) to %s', n_shared,
                 global_shared_path)
 
+    if args.shared_summary:
+        _write_shared_summary(
+            exported_items, kmer_to_samples, args.shared_summary,
+            args.top_shared)
+        logger.info('Wrote shared summary to %s', args.shared_summary)
+
     if fast_mode:
         logger.info('Fast mode: skipping heavy sequence-export steps.')
-        out_long = (args.output if args.output.lower().endswith('.csv')
-                    else args.output + '.csv')
-        write_long_csv(sample_hash_counts, out_long)
-        logger.info('Wrote sparse long CSV to %s', out_long)
         return
 
     # ── Heavy path: sequence exports ──────────────────────────────────────────
@@ -1066,6 +1362,20 @@ def _detect_outliers(
 # Plotting (D2: moved to module level from nested-inside-main)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _load_plotting():
+    """Import plotting dependencies only when plots are requested."""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt_mod
+        import numpy as np_mod
+        return plt_mod, np_mod
+    except Exception as exc:
+        logging.getLogger('OutliMer').warning(
+            'matplotlib/numpy not available; cannot generate plots: %s', exc)
+        return None, None
+
+
 def generate_plots(
     report_rows: List[Tuple[str, int, int, float, int]],
     sample_hash_counts: Dict[str, Dict[int, int]],
@@ -1074,8 +1384,8 @@ def generate_plots(
     logger: logging.Logger,
 ) -> None:
     """Generate shared/unique stacked bar, Jaccard heatmap, and fraction histogram."""
+    plt, np = _load_plotting()
     if plt is None or np is None:
-        logger.warning('matplotlib/numpy not available; cannot generate plots')
         return
 
     samples = [r[0] for r in report_rows]
@@ -1169,7 +1479,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     req.add_argument('--input-dir', required=True,
                      help='Directory containing input files')
     req.add_argument('--input-type',
-                     choices=['paired-fastq', 'single-fastq', 'fasta'],
+                     choices=['paired-fastq', 'single-fastq', 'fasta',
+                              'signature'],
                      default='paired-fastq', required=True,
                      help='Type of files in --input-dir (default: paired-fastq)')
     req.add_argument('--out-dir', required=True,
@@ -1190,6 +1501,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help='k-mer size (default: 31)')
     sketch.add_argument('--scaled', type=int, default=10000,
                         help='sourmash scaled parameter (default: 10000)')
+    sketch.add_argument('--cache-dir',
+                        help='Directory for reusable per-sample sketch caches '
+                             '(default: <out-dir>/sketch_cache)')
+    sketch.add_argument('--no-cache', action='store_true',
+                        help='Disable sketch cache reads/writes')
+
+    # ── Sample metadata ──────────────────────────────────────────────────────
+    meta = parser.add_argument_group('Sample metadata')
+    meta.add_argument('--metadata',
+                      help='Sample metadata CSV/TSV with one row per sample')
+    meta.add_argument('--metadata-sample-column', default='sample',
+                      help='Column in --metadata containing sample names '
+                           '(default: sample)')
 
     # ── Output files ──────────────────────────────────────────────────────────
     out_grp = parser.add_argument_group('Output file paths')
@@ -1197,7 +1521,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     out_grp.add_argument('--output', default='kmer_counts.csv',
                          help='Path for main CSV output (default: kmer_counts.csv)')
     # B1: --report was used but never registered
-    out_grp.add_argument('--report', default=None,
+    out_grp.add_argument('--report', default='kmer_report.csv',
                          help='Path for per-sample hash-comparison report CSV')
     # B1: --shared-summary was used but never registered
     out_grp.add_argument('--shared-summary', default=None,
@@ -1209,10 +1533,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     exp.add_argument('--top-per-sample', type=int, default=200,
                      help='Max top k-mers exported per sample (default: 200)')
     exp.add_argument('--force-top', action='store_true',
-                     help='Force exactly --top-per-sample items even when '
-                          'MinHash contains fewer (slow)')
+                     help='Fail if a sample has fewer than --top-per-sample '
+                          'available hashes')
     exp.add_argument('--export-unique-shared', action='store_true',
-                     help='Also write per-sample unique/shared files')
+                     help='Also write per-sample unique/shared hash files')
     exp.add_argument('--fill-unique', action='store_true',
                      help='Pad per-sample unique file to --top-per-sample with '
                           'shared hashes')
@@ -1299,8 +1623,47 @@ def build_arg_parser() -> argparse.ArgumentParser:
                       help='Verbose progress output')
     misc.add_argument('--threads', type=int, default=4,
                       help='Threads for parallel sample sketching (default: 4)')
+    misc.add_argument('--multiqc', action='store_true',
+                      help='Write MultiQC custom-content JSON')
+    misc.add_argument('--ro-crate', action='store_true',
+                      help='Write minimal ro-crate-metadata.json provenance')
 
     return parser
+
+
+def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.ksize <= 0:
+        parser.error('--ksize must be > 0')
+    if args.scaled <= 0:
+        parser.error('--scaled must be > 0')
+    if args.threads <= 0:
+        parser.error('--threads must be > 0')
+    if args.map_threads <= 0:
+        parser.error('--map-threads must be > 0')
+    if args.top_per_sample < 0:
+        parser.error('--top-per-sample must be >= 0')
+    if args.top_shared < 0:
+        parser.error('--top-shared must be >= 0')
+    if args.global_top < 0:
+        parser.error('--global-top must be >= 0')
+    if args.outlier_top < 0:
+        parser.error('--outlier-top must be >= 0')
+    if args.outlier_threshold < 0 or args.outlier_threshold > 1:
+        parser.error('--outlier-threshold must be between 0 and 1')
+    if args.profile_update and not args.profile_name:
+        parser.error('--profile-update requires --profile-name')
+    if args.write_db_each and not args.incremental:
+        parser.error('--write-db-each requires --incremental')
+    if args.no_cache and args.cache_dir:
+        parser.error('--no-cache cannot be combined with --cache-dir')
+    if args.fill_unique and not args.export_unique_shared:
+        args.export_unique_shared = True
+    if args.input_type == 'signature':
+        if args.collect_sequences or args.export_sequences or args.outlier_seq_per_hash:
+            parser.error(
+                'signature input does not contain sequences; disable '
+                '--collect-sequences, --export-sequences, and '
+                '--outlier-seq-per-hash')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1310,6 +1673,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    _validate_args(parser, args)
 
     if sourmash is None:
         parser.error('sourmash Python library is required. '
@@ -1340,8 +1704,15 @@ def main(argv=None) -> int:
         return path
 
     args.output = _resolve(args.output, 'kmer_counts.csv')
+    if args.cache_dir:
+        args.cache_dir = _resolve(args.cache_dir, os.path.basename(args.cache_dir))
+    elif not args.no_cache:
+        args.cache_dir = os.path.join(out_dir, 'sketch_cache')
     if args.report:
         args.report = _resolve(args.report, 'report.csv')
+    if args.shared_summary:
+        args.shared_summary = _resolve(
+            args.shared_summary, os.path.basename(args.shared_summary))
     if args.db_out:
         args.db_out = _resolve(args.db_out, os.path.basename(args.db_out))
     if args.export_kmers_dir:
@@ -1350,6 +1721,9 @@ def main(argv=None) -> int:
         args.export_kmers_dir = os.path.join(out_dir, 'export_kmers')
     if args.map_out:
         args.map_out = _resolve(args.map_out, os.path.basename(args.map_out))
+    if args.top_union_summary:
+        args.top_union_summary = _resolve(
+            args.top_union_summary, os.path.basename(args.top_union_summary))
     if not args.plot_prefix:
         args.plot_prefix = os.path.join(out_dir, 'kmer_plots')
     elif not os.path.isabs(args.plot_prefix) and not os.path.dirname(args.plot_prefix):
@@ -1389,6 +1763,24 @@ def main(argv=None) -> int:
         else:
             logger.info('  %s: %s (single)', name, os.path.basename(r1))
 
+    metadata: Dict[str, Dict[str, str]] = {}
+    metadata_columns: List[str] = []
+    if args.metadata:
+        try:
+            metadata, metadata_columns = load_sample_metadata(
+                args.metadata, args.metadata_sample_column)
+        except Exception as exc:
+            parser.error(f'Failed to load --metadata {args.metadata}: {exc}')
+        pair_names = {name for name, _, _ in pairs}
+        missing_metadata = sorted(pair_names - set(metadata))
+        if missing_metadata:
+            logger.warning('Metadata missing for %d sample(s): %s',
+                           len(missing_metadata), ','.join(missing_metadata[:10]))
+        extra_metadata = sorted(set(metadata) - pair_names)
+        if extra_metadata:
+            logger.warning('Metadata has %d sample(s) not in this run',
+                           len(extra_metadata))
+
     # ── Load DB ───────────────────────────────────────────────────────────────
     db_hashes: Set[int] = set()
     db_loaded = False
@@ -1399,7 +1791,7 @@ def main(argv=None) -> int:
             db_loaded = True
             logger.info('Loaded %d hashes from DB', len(db_hashes))
         except Exception as exc:
-            logger.error('Failed to load DB %s: %s', args.db_in, exc)
+            parser.error(f'Failed to load --db-in {args.db_in}: {exc}')
 
     # ── Load profile ──────────────────────────────────────────────────────────
     profile_dir: Optional[str] = None
@@ -1407,6 +1799,8 @@ def main(argv=None) -> int:
     profile_samples: Set[str] = set()
     if args.profile_load:
         profile_dir = args.profile_load
+        if not os.path.isdir(profile_dir):
+            parser.error(f'--profile-load is not a directory: {profile_dir}')
         try:
             db_path = os.path.join(profile_dir, 'db.txt.gz')
             if not os.path.exists(db_path):
@@ -1436,7 +1830,7 @@ def main(argv=None) -> int:
             logger.info('Loaded profile: %d samples, %d agg hashes, db=%s',
                         len(profile_samples), len(profile_agg_counts), db_loaded)
         except Exception as exc:
-            logger.error('Failed to load profile from %s: %s', profile_dir, exc)
+            parser.error(f'Failed to load profile from {profile_dir}: {exc}')
 
     # ── R4: compute top_n once ────────────────────────────────────────────────
     top_n: Optional[int] = (args.top_per_sample
@@ -1461,6 +1855,7 @@ def main(argv=None) -> int:
         profile_update=args.profile_update,
         profile_name=args.profile_name,
         threads=args.threads,
+        cache_dir=None if args.no_cache else args.cache_dir,
         logger=logger,
     )
 
@@ -1471,11 +1866,10 @@ def main(argv=None) -> int:
     # ── Always write union summary ────────────────────────────────────────────
     try:
         seq_map_arg = sourmash_seq_map if sourmash_seq_map else None
-        union_filename = (os.path.basename(args.top_union_summary)
-                          if args.top_union_summary else 'top_union_summary.csv')
         union_path = write_union_summary(
             sample_hash_counts, out_dir,
-            seq_map=seq_map_arg, filename=union_filename)
+            seq_map=seq_map_arg,
+            out_path=args.top_union_summary if args.top_union_summary else None)
         logger.info('Wrote union summary to %s', union_path)
     except Exception as exc:
         logger.warning('Failed to write union summary: %s', exc)
@@ -1529,11 +1923,22 @@ def main(argv=None) -> int:
     if args.report:
         with open(args.report, 'w', newline='') as fh:
             writer = csv.writer(fh)
-            writer.writerow(['sample', 'n_hashes', 'n_in_db',
+            writer.writerow(['sample'] + metadata_columns +
+                            ['n_hashes', 'n_in_db',
                              'pct_in_db', 'n_new_hashes'])
             for row in report_rows:
-                writer.writerow(row)
+                sample = row[0]
+                meta_values = [
+                    metadata.get(sample, {}).get(column, '')
+                    for column in metadata_columns
+                ]
+                writer.writerow([sample] + meta_values + list(row[1:]))
         logger.info('Wrote report to %s', args.report)
+
+    multiqc_path: Optional[str] = None
+    if args.multiqc:
+        multiqc_path = write_multiqc_summary(report_rows, out_dir)
+        logger.info('Wrote MultiQC custom content to %s', multiqc_path)
 
     # ── CSV matrix output ─────────────────────────────────────────────────────
     if args.full_exports:
@@ -1619,6 +2024,51 @@ def main(argv=None) -> int:
             for n in sorted(profile_samples):
                 sf.write(n + '\n')
         logger.info('Saved profile "%s" to %s', args.profile_name, prof_out_dir)
+
+    manifest_path = os.path.join(out_dir, 'run_manifest.json')
+    manifest = {
+        'input_type': args.input_type,
+        'ksize': args.ksize,
+        'scaled': args.scaled,
+        'n_samples': len(sample_hash_counts),
+        'samples': sorted(sample_hash_counts),
+        'metadata_columns': metadata_columns,
+        'cache_dir': None if args.no_cache else args.cache_dir,
+        'outputs': {
+            'report': args.report,
+            'union_summary': union_path if 'union_path' in locals() else None,
+            'matrix': args.output if args.full_exports else None,
+        },
+    }
+    with open(manifest_path, 'w') as mf:
+        json.dump(manifest, mf, indent=2, sort_keys=True)
+    logger.info('Wrote run manifest to %s', manifest_path)
+
+    if args.ro_crate:
+        input_paths = {
+            'input_dir': args.input_dir,
+            'metadata': args.metadata or '',
+            'db_in': args.db_in or '',
+        }
+        output_paths = {
+            'report': args.report,
+            'union_summary': union_path if 'union_path' in locals() else None,
+            'matrix': args.output if args.full_exports else None,
+            'manifest': manifest_path,
+            'multiqc': multiqc_path,
+        }
+        crate_path = write_ro_crate_metadata(
+            out_dir,
+            input_paths,
+            output_paths,
+            {
+                'input_type': args.input_type,
+                'ksize': args.ksize,
+                'scaled': args.scaled,
+                'n_samples': len(sample_hash_counts),
+            },
+        )
+        logger.info('Wrote RO-Crate metadata to %s', crate_path)
 
     logger.info('Done.')
     return 0
