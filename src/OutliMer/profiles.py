@@ -8,6 +8,7 @@ import json
 import os
 from typing import Iterable
 
+from OutliMer import __version__
 from OutliMer.OutliMer import load_hash_db, save_hash_db
 
 
@@ -105,6 +106,9 @@ def _write_json_or_print(payload: dict, out_path: str | None) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manage OutliMer hash profiles.")
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     describe = sub.add_parser("describe", help="Describe a profile directory")

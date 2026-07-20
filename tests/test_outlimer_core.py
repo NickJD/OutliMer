@@ -1,6 +1,7 @@
 import csv
 import contextlib
 import io
+import json
 import os
 import sys
 import tempfile
@@ -40,6 +41,43 @@ class OutliMerCoreTests(unittest.TestCase):
             (2, 3, 2 / 3),
         )
 
+    def test_paired_discovery_rejects_orphans_and_duplicate_mates(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orphan = os.path.join(tmpdir, "orphan_R1.fastq")
+            with open(orphan, "w") as fh:
+                fh.write("@r\nACGT\n+\n!!!!\n")
+            with self.assertRaisesRegex(ValueError, "no matching mate"):
+                outlimer.gather_samples_from_dir(tmpdir, "paired-fastq")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for name in ("sample_R1.fastq", "sample_R1.fq", "sample_R2.fastq"):
+                with open(os.path.join(tmpdir, name), "w") as fh:
+                    fh.write("@r\nACGT\n+\n!!!!\n")
+            with self.assertRaisesRegex(ValueError, "duplicate R1"):
+                outlimer.gather_samples_from_dir(tmpdir, "paired-fastq")
+
+    def test_fastq_parser_rejects_truncated_and_length_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            truncated = os.path.join(tmpdir, "truncated.fastq")
+            with open(truncated, "w") as fh:
+                fh.write("@r\nACGT\n+\n")
+            with self.assertRaisesRegex(ValueError, "truncated FASTQ"):
+                list(outlimer.fastq_sequences(truncated))
+
+            mismatch = os.path.join(tmpdir, "mismatch.fastq")
+            with open(mismatch, "w") as fh:
+                fh.write("@r\nACGT\n+\n!!!\n")
+            with self.assertRaisesRegex(ValueError, "lengths differ"):
+                list(outlimer.fastq_sequences(mismatch))
+
+    def test_fasta_parser_requires_headers_and_sequences(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "bad.fa")
+            with open(path, "w") as fh:
+                fh.write("ACGT\n")
+            with self.assertRaisesRegex(ValueError, "before first FASTA header"):
+                list(outlimer.fasta_sequences(path))
+
     def test_write_union_summary_honors_explicit_output_path(self):
         counts = {
             "s1": {10: 2, 20: 1},
@@ -71,6 +109,45 @@ class OutliMerCoreTests(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 outlimer._validate_args(parser, args)
+
+    def test_partial_sample_failure_requires_explicit_opt_in(self):
+        class FakeMinHash:
+            def __init__(self, **kwargs):
+                self.hashes = {}
+
+            def add_sequence(self, sequence, force=True):
+                self.hashes[len(sequence)] = self.hashes.get(len(sequence), 0) + 1
+
+        old_sourmash = outlimer.sourmash
+        old_minhash = outlimer.MinHash
+        outlimer.sourmash = object()
+        outlimer.MinHash = FakeMinHash
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                inputs = os.path.join(tmpdir, "inputs")
+                os.makedirs(inputs)
+                with open(os.path.join(inputs, "good.fa"), "w") as fh:
+                    fh.write(">good\nACGTACGT\n")
+                with open(os.path.join(inputs, "bad.fa"), "w") as fh:
+                    fh.write("ACGT\n")
+
+                base_args = [
+                    "--input-dir", inputs,
+                    "--input-type", "fasta",
+                    "--out-dir", os.path.join(tmpdir, "out"),
+                    "--no-cache",
+                ]
+                self.assertEqual(outlimer.main(base_args), 1)
+                self.assertEqual(outlimer.main(base_args + ["--allow-partial"]), 0)
+                with open(os.path.join(tmpdir, "out", "run_manifest.json")) as fh:
+                    manifest = json.load(fh)
+                self.assertEqual(manifest["schema_version"], 2)
+                self.assertEqual(manifest["seed"], 42)
+                self.assertIn("OutliMer", manifest["software_versions"])
+                self.assertIn("bad", manifest["failed_samples"])
+        finally:
+            outlimer.sourmash = old_sourmash
+            outlimer.MinHash = old_minhash
 
 
 if __name__ == "__main__":

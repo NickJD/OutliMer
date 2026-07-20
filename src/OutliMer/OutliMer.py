@@ -1,75 +1,39 @@
-"""
-OutliMer.py  –  Identify outlier samples via sourmash k-mer MinHash sketching.
-
-Fixes applied vs original
-─────────────────────────
-BUGS
-  B1  Missing argparse definitions for --pair, --output, --report,
-      --shared-summary, --write-db-each, and all --outlier-* flags.
-  B2  Dead second `if hasattr(mh, "hashes")` branch in both build_minhash
-      functions was unreachable; removed.
-  B3  export_top_union CSV block was indented inside the per-sample debug loop
-      so the file was rewritten on every iteration; moved outside the loop.
-  B4  `globals()` used to test a local variable (sourmash_seq_map); replaced
-      with a direct reference.
-  B5  find_examples_for_hashes called with empty r2 path for single-end
-      samples, which would crash open(); guarded.
-  B6  Dead `if not line: break` in fasta_sequences removed (file iteration
-      never yields an empty string).
-  B7  Always-true `'report_rows' in locals()` guard removed.
-
-REDUNDANCIES
-  R1  Duplicate MinHash hash-extraction logic extracted into _extract_hash_counts().
-  R2  Extension lists unified into module-level EXTENSIONS_MAP constant.
-  R3  Double "dropped singles" log message deduplicated.
-  R4  `top_n` recomputed in three separate places; now computed once early in main.
-  R5  Redundant seq.strip() in find_examples_for_hashes removed
-      (fastq_sequences already strips).
-  R6  total_counts aggregation computed once via _compute_total_counts() and reused.
-
-DESIGN / STRUCTURAL
-  D1  builtins.print monkey-patch removed; logging.Logger used throughout.
-  D2  main() decomposed: process_samples(), _run_exports(), _detect_outliers(),
-      generate_plots(), and build_arg_parser() are now separate functions.
-  D3  --input-substring changed from required=True to optional (default None).
-  D4  Silent `except Exception: pass` blocks replaced with logger.debug() calls.
-  D5  Pervasive hasattr(args,...) guards replaced with argparse-declared defaults.
-
-OPTIMISATIONS
-  O1  compare_sample_to_db uses set intersection (len(a & b)) instead of a loop.
-  O2  Pairwise Jaccard heatmap computes only the upper triangle then mirrors.
-  O3  find_examples_for_hashes breaks the inner k-mer loop early when all
-      target hashes have been found.
-  O4  Sample sketching parallelised with ThreadPoolExecutor (sourmash releases
-      the GIL during its C-level hashing, so threads provide real concurrency).
-"""
+"""Core OutliMer sketching and reporting command-line interface."""
 
 import argparse
 import concurrent.futures
 import csv
 import gzip
+import importlib.metadata
 import json
 import logging
 import os
+import platform
 import re
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
+from OutliMer import __version__
+
+SOURMASH_IMPORT_ERROR: Optional[Exception] = None
 try:
     import sourmash
     from sourmash import MinHash
-except Exception:
+except Exception as exc:
     sourmash = None
     MinHash = None
+    SOURMASH_IMPORT_ERROR = exc
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Module-level constants  (R2: replaces duplicated inline dicts)
 # ─────────────────────────────────────────────────────────────────────────────
 
 FASTQ_EXTENSIONS: List[str] = ['.fastq', '.fq', '.fastq.gz', '.fq.gz']
-FASTA_EXTENSIONS: List[str] = ['.fa', '.fasta', '.fna', '.fa.gz', '.fasta.gz']
+FASTA_EXTENSIONS: List[str] = [
+    '.fa', '.fasta', '.fna', '.fa.gz', '.fasta.gz', '.fna.gz',
+]
 SIG_EXTENSIONS: List[str] = ['.sig', '.sig.gz']
 
 EXTENSIONS_MAP: Dict[str, List[str]] = {
@@ -85,46 +49,71 @@ EXTENSIONS_MAP: Dict[str, List[str]] = {
 
 def open_maybe_gz(path: str):
     """Open a plain or gzip-compressed text file for reading."""
-    if path.endswith('.gz'):
-        return gzip.open(path, 'rt', errors='replace')
-    return open(path, 'r', errors='replace')
+    if path.lower().endswith('.gz'):
+        return gzip.open(path, 'rt', errors='strict')
+    return open(path, 'r', errors='strict')
 
 
 def fastq_sequences(path: str) -> Iterator[str]:
-    """Yield sequence strings from a FASTQ file (plain or gzipped)."""
+    """Yield sequences from a validated four-line FASTQ file."""
     with open_maybe_gz(path) as fh:
+        record = 0
         while True:
             header = fh.readline()
             if not header:
                 break
+            record += 1
             seq = fh.readline()
-            if not seq:
-                break
-            fh.readline()   # '+'
-            fh.readline()   # quality
-            yield seq.strip()
+            plus = fh.readline()
+            quality = fh.readline()
+            if not seq or not plus or not quality:
+                raise ValueError(
+                    f'{path}: truncated FASTQ record {record}')
+            if not header.startswith('@'):
+                raise ValueError(
+                    f'{path}: record {record} header does not start with @')
+            if not plus.startswith('+'):
+                raise ValueError(
+                    f'{path}: record {record} separator does not start with +')
+            sequence = seq.rstrip('\r\n')
+            qualities = quality.rstrip('\r\n')
+            if not sequence:
+                raise ValueError(f'{path}: record {record} has an empty sequence')
+            if len(sequence) != len(qualities):
+                raise ValueError(
+                    f'{path}: record {record} sequence/quality lengths differ '
+                    f'({len(sequence)} != {len(qualities)})')
+            yield sequence
 
 
 def fasta_sequences(path: str) -> Iterator[str]:
-    """Yield sequence strings from a FASTA file (plain or gzipped).
-
-    B6: removed the dead `if not line: break` guard – iterating a file object
-    never yields an empty string; the loop simply ends at EOF.
-    """
+    """Yield sequences from a validated FASTA file."""
     with open_maybe_gz(path) as fh:
         seq_lines: List[str] = []
+        seen_header = False
+        record = 0
         for line in fh:
-            line = line.rstrip('\n')
+            line = line.rstrip('\r\n')
             if not line:
                 continue
             if line.startswith('>'):
-                if seq_lines:
+                if seen_header and not seq_lines:
+                    raise ValueError(
+                        f'{path}: FASTA record {record} has no sequence')
+                if seen_header:
                     yield ''.join(seq_lines)
-                    seq_lines = []
+                record += 1
+                seen_header = True
+                seq_lines = []
                 continue
+            if not seen_header:
+                raise ValueError(f'{path}: sequence found before first FASTA header')
             seq_lines.append(line.strip())
-        if seq_lines:
-            yield ''.join(seq_lines)
+        if not seen_header:
+            raise ValueError(f'{path}: no FASTA records found')
+        if not seq_lines:
+            raise ValueError(f'{path}: FASTA record {record} has no sequence')
+        yield ''.join(seq_lines)
 
 
 def load_sample_metadata(
@@ -154,7 +143,9 @@ def load_sample_metadata(
         for row in reader:
             sample = (row.get(sample_column) or '').strip()
             if not sample:
-                continue
+                raise ValueError('metadata contains a blank sample name')
+            if sample in metadata:
+                raise ValueError(f'duplicate metadata sample: {sample}')
             metadata[sample] = {
                 c: (row.get(c) or '') for c in metadata_columns
             }
@@ -207,19 +198,29 @@ def _extract_hash_counts(mh: 'MinHash') -> Dict[int, int]:
         'Check sourmash version compatibility.')
 
 
-def _load_signature_counts(path: str, ksize: int) -> Dict[int, int]:
-    """Load hash counts from the first compatible sourmash signature."""
+def _load_signature_counts(
+    path: str,
+    ksize: int,
+    scaled: int,
+    seed: int,
+) -> Dict[int, int]:
+    """Load one compatible DNA abundance signature at a common scale."""
     if sourmash is None:
         raise RuntimeError('sourmash not installed')
 
-    signatures = None
     if hasattr(sourmash, 'load_file_as_signatures'):
-        signatures = list(sourmash.load_file_as_signatures(path, ksize=ksize))
+        try:
+            signatures = list(sourmash.load_file_as_signatures(
+                path, ksize=ksize, select_moltype='DNA'))
+        except TypeError:
+            signatures = list(sourmash.load_file_as_signatures(
+                path, ksize=ksize))
     else:
         from sourmash.signature import load_signatures_from_json
         with open_maybe_gz(path) as fh:
             signatures = list(load_signatures_from_json(fh.read(), ksize=ksize))
 
+    compatible = []
     for sig in signatures:
         mh = getattr(sig, 'minhash', None)
         if mh is None:
@@ -227,9 +228,41 @@ def _load_signature_counts(path: str, ksize: int) -> Dict[int, int]:
         sig_ksize = getattr(mh, 'ksize', ksize)
         if int(sig_ksize) != int(ksize):
             continue
-        return _extract_hash_counts(mh)
+        moltype = str(getattr(mh, 'moltype', 'DNA')).upper()
+        if moltype != 'DNA':
+            continue
+        compatible.append(mh)
 
-    raise RuntimeError(f'No DNA signature with ksize={ksize} found in {path}')
+    if not compatible:
+        raise RuntimeError(f'No DNA signature with ksize={ksize} found in {path}')
+    if len(compatible) > 1:
+        raise RuntimeError(
+            f'{path} contains {len(compatible)} compatible signatures; '
+            'provide one DNA signature per file')
+
+    mh = compatible[0]
+    sig_seed = int(getattr(mh, 'seed', seed))
+    if sig_seed != seed:
+        raise RuntimeError(
+            f'{path} uses seed={sig_seed}, expected seed={seed}')
+    if not bool(getattr(mh, 'track_abundance', True)):
+        raise RuntimeError(
+            f'{path} does not track hash abundance; abundance signatures are required')
+    sig_scaled = int(getattr(mh, 'scaled', scaled))
+    if sig_scaled <= 0:
+        raise RuntimeError(f'{path} is not a scaled MinHash signature')
+    if sig_scaled > scaled:
+        raise RuntimeError(
+            f'{path} uses scaled={sig_scaled}, which is sparser than requested '
+            f'scaled={scaled} and cannot be upsampled')
+    if sig_scaled < scaled:
+        if not hasattr(mh, 'downsample'):
+            raise RuntimeError(
+                f'{path} uses scaled={sig_scaled}; sourmash cannot downsample '
+                f'it to requested scaled={scaled}')
+        mh = mh.downsample(scaled=scaled)
+
+    return _extract_hash_counts(mh)
 
 
 def _sketch_sample(
@@ -238,6 +271,7 @@ def _sketch_sample(
     r2: str,
     ksize: int,
     scaled: int,
+    seed: int,
     input_type: str,
 ) -> Tuple[str, Optional[Dict[int, int]], Optional[str]]:
     """Build a MinHash sketch for one sample.  Returns (name, counts, error).
@@ -250,9 +284,15 @@ def _sketch_sample(
         return name, None, 'sourmash not installed'
     try:
         if input_type == 'signature':
-            return name, _load_signature_counts(r1, ksize), None
+            return name, _load_signature_counts(r1, ksize, scaled, seed), None
 
-        mh = MinHash(ksize=ksize, n=0, scaled=scaled, track_abundance=True)
+        mh = MinHash(
+            ksize=ksize,
+            n=0,
+            scaled=scaled,
+            seed=seed,
+            track_abundance=True,
+        )
         if r2:
             for seq in fastq_sequences(r1):
                 mh.add_sequence(seq, force=True)
@@ -281,6 +321,8 @@ def gather_samples_from_dir(
     R2: uses the module-level EXTENSIONS_MAP instead of a locally-redefined dict.
     For single-fastq and fasta types, r2 is always ''.
     """
+    if not os.path.isdir(input_dir):
+        raise ValueError(f'input directory does not exist: {input_dir}')
     allowed_exts = EXTENSIONS_MAP.get(input_type, FASTQ_EXTENSIONS)
 
     entries: List[str] = []
@@ -294,7 +336,7 @@ def gather_samples_from_dir(
             entries.append(fn)
 
     if input_type == 'paired-fastq':
-        pairs_map: Dict[str, Dict[str, str]] = {}
+        pairs_map: Dict[str, Dict[str, object]] = {}
         for fn in entries:
             stem = fn
             for ext in ['.fastq.gz', '.fq.gz', '.fastq', '.fq']:
@@ -319,22 +361,41 @@ def gather_samples_from_dir(
                     read = m.group('read')
             if prefix is None:
                 prefix = stem
+            if not prefix:
+                raise ValueError(f'could not derive a sample name from {fn}')
             fullpath = os.path.join(input_dir, fn)
             rec = pairs_map.setdefault(prefix, {})
             if read == '1':
+                if '1' in rec:
+                    raise ValueError(
+                        f'duplicate R1 files for sample {prefix}: '
+                        f'{os.path.basename(str(rec["1"]))}, {fn}')
                 rec['1'] = fullpath
             elif read == '2':
+                if '2' in rec:
+                    raise ValueError(
+                        f'duplicate R2 files for sample {prefix}: '
+                        f'{os.path.basename(str(rec["2"]))}, {fn}')
                 rec['2'] = fullpath
             else:
-                rec.setdefault('singles', []).append(fullpath)
+                singles = rec.setdefault('singles', [])
+                assert isinstance(singles, list)
+                singles.append(fullpath)
 
         out: List[Tuple[str, str, str]] = []
+        problems: List[str] = []
         for pfx, rec in sorted(pairs_map.items()):
             if '1' in rec and '2' in rec:
-                out.append((pfx, rec['1'], rec['2']))
+                out.append((pfx, str(rec['1']), str(rec['2'])))
             else:
-                for i, s in enumerate(rec.get('singles', [])):
-                    out.append((f'{pfx}_single{i + 1}', s, ''))
+                if '1' in rec or '2' in rec:
+                    present = 'R1' if '1' in rec else 'R2'
+                    problems.append(f'{pfx} has {present} but no matching mate')
+                for path in rec.get('singles', []):
+                    problems.append(
+                        f'cannot determine R1/R2 from {os.path.basename(str(path))}')
+        if problems:
+            raise ValueError('invalid paired FASTQ inputs: ' + '; '.join(problems))
         return out
 
     # single-fastq or fasta
@@ -347,6 +408,32 @@ def gather_samples_from_dir(
                 break
         out.append((stem, os.path.join(input_dir, fn), ''))
     return out
+
+
+def validate_sample_inputs(
+    samples: List[Tuple[str, str, str]],
+    input_type: str,
+) -> None:
+    """Validate sample names, file paths, and paired-read completeness."""
+    seen: Set[str] = set()
+    for name, r1, r2 in samples:
+        if not name.strip():
+            raise ValueError('sample names must not be blank')
+        if name in seen:
+            raise ValueError(f'duplicate sample name: {name}')
+        seen.add(name)
+        if not os.path.isfile(r1):
+            raise ValueError(f'{name}: input file does not exist: {r1}')
+        if input_type == 'paired-fastq':
+            if not r2:
+                raise ValueError(f'{name}: paired FASTQ sample has no R2 file')
+            if not os.path.isfile(r2):
+                raise ValueError(f'{name}: input file does not exist: {r2}')
+            if os.path.abspath(r1) == os.path.abspath(r2):
+                raise ValueError(f'{name}: R1 and R2 refer to the same file')
+        elif r2:
+            raise ValueError(
+                f'{name}: R2 is only valid with --input-type paired-fastq')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -616,11 +703,25 @@ def _source_fingerprint(paths: Tuple[str, str]) -> List[Dict[str, int | str]]:
     return fingerprint
 
 
+def _runtime_versions() -> Dict[str, str]:
+    versions = {'OutliMer': __version__, 'Python': platform.python_version()}
+    for distribution in (
+        'sourmash', 'numpy', 'pandas', 'scipy', 'scikit-learn',
+        'matplotlib', 'seaborn',
+    ):
+        try:
+            versions[distribution] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            versions[distribution] = 'not installed'
+    return versions
+
+
 def _cache_payload_metadata(
     sample: str,
     paths: Tuple[str, str],
     ksize: int,
     scaled: int,
+    seed: int,
     input_type: str,
 ) -> Dict[str, object]:
     return {
@@ -628,8 +729,9 @@ def _cache_payload_metadata(
         'inputs': _source_fingerprint(paths),
         'ksize': int(ksize),
         'scaled': int(scaled),
+        'seed': int(seed),
         'input_type': input_type,
-        'schema': 1,
+        'schema': 2,
     }
 
 
@@ -643,6 +745,7 @@ def _load_cached_counts(
     paths: Tuple[str, str],
     ksize: int,
     scaled: int,
+    seed: int,
     input_type: str,
 ) -> Optional[Dict[int, int]]:
     if not cache_dir:
@@ -652,7 +755,8 @@ def _load_cached_counts(
         return None
     with open(path) as fh:
         payload = json.load(fh)
-    expected = _cache_payload_metadata(sample, paths, ksize, scaled, input_type)
+    expected = _cache_payload_metadata(
+        sample, paths, ksize, scaled, seed, input_type)
     if payload.get('metadata') != expected:
         return None
     counts = payload.get('counts', {})
@@ -665,6 +769,7 @@ def _save_cached_counts(
     paths: Tuple[str, str],
     ksize: int,
     scaled: int,
+    seed: int,
     input_type: str,
     counts: Dict[int, int],
 ) -> None:
@@ -672,7 +777,8 @@ def _save_cached_counts(
         return
     os.makedirs(cache_dir, exist_ok=True)
     payload = {
-        'metadata': _cache_payload_metadata(sample, paths, ksize, scaled, input_type),
+        'metadata': _cache_payload_metadata(
+            sample, paths, ksize, scaled, seed, input_type),
         'counts': {str(int(h)): int(c) for h, c in counts.items()},
     }
     with open(_cache_path(cache_dir, sample), 'w') as fh:
@@ -742,6 +848,7 @@ def write_ro_crate_metadata(
                 'name': 'OutliMer run',
                 'dateCreated': datetime.now(timezone.utc).isoformat(),
                 'hasPart': [{'@id': item['@id']} for item in file_entities],
+                'softwareVersion': __version__,
                 'outlimerParameters': parameters,
             },
             *file_entities,
@@ -761,6 +868,7 @@ def process_samples(
     pairs: List[Tuple[str, str, str]],
     ksize: int,
     scaled: int,
+    seed: int,
     input_type: str,
     collect_sequences: bool,
     top_per_sample: int,
@@ -779,6 +887,7 @@ def process_samples(
     Dict[int, List[Tuple[str, str]]],  # sourmash_seq_map
     Dict[int, int],              # updated profile_agg_counts
     Set[str],                    # updated profile_samples
+    Dict[str, str],              # failed sample -> error
 ]:
     """Sketch all samples in parallel and collect sequence mappings.
 
@@ -788,6 +897,7 @@ def process_samples(
     sample_hash_counts: Dict[str, Dict[int, int]] = {}
     sample_files: Dict[str, Tuple[str, str]] = {}
     sourmash_seq_map: Dict[int, List[Tuple[str, str]]] = {}
+    failures: Dict[str, str] = {}
 
     # Determine which samples need sketching
     to_sketch: List[Tuple[str, str, str]] = []
@@ -798,7 +908,7 @@ def process_samples(
             continue
         try:
             cached = _load_cached_counts(
-                cache_dir, name, (r1, r2), ksize, scaled, input_type)
+                cache_dir, name, (r1, r2), ksize, scaled, seed, input_type)
         except Exception as exc:
             logger.debug('Cache read failed for %s: %s', name, exc)
             cached = None
@@ -836,21 +946,27 @@ def process_samples(
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
         futures = {
-            pool.submit(_sketch_sample, name, r1, r2, ksize, scaled, input_type):
+            pool.submit(
+                _sketch_sample, name, r1, r2, ksize, scaled, seed, input_type):
                 (name, r1, r2)
             for name, r1, r2 in to_sketch
         }
         for fut in concurrent.futures.as_completed(futures):
             name, r1, r2 = futures[fut]
-            sketch_name, counts, error = fut.result()
+            try:
+                sketch_name, counts, error = fut.result()
+            except Exception as exc:
+                sketch_name, counts, error = name, None, str(exc)
             if error or counts is None:
                 logger.warning('Failed to process sample %s: %s', name, error)
+                failures[name] = error or 'unknown processing error'
                 continue
             sample_hash_counts[name] = counts
             sample_files[name] = (r1, r2)
             try:
                 _save_cached_counts(
-                    cache_dir, name, (r1, r2), ksize, scaled, input_type, counts)
+                    cache_dir, name, (r1, r2), ksize, scaled, seed,
+                    input_type, counts)
             except Exception as exc:
                 logger.debug('Cache write failed for %s: %s', name, exc)
 
@@ -890,7 +1006,7 @@ def process_samples(
                                      name, exc)
 
     return (sample_hash_counts, sample_files, sourmash_seq_map,
-            profile_agg_counts, profile_samples)
+            profile_agg_counts, profile_samples, failures)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1459,20 +1575,15 @@ def generate_plots(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Build and return the CLI argument parser.
-
-    B1: all previously missing arguments (--pair, --output, --report,
-    --shared-summary, --write-db-each, and all --outlier-* flags) are now
-    properly registered.
-    D3: --input-substring changed from required=True to optional.
-    D5: explicit defaults mean hasattr(args,...) guards are no longer needed.
-    """
+    """Build and return the CLI argument parser."""
     parser = argparse.ArgumentParser(
         description=(
-            'Kmerise un/paired FASTQ/FASTA files with sourmash and output '
-            'per-sample hashed k-mer counts as CSV, identifying outlier samples.'
+            'Sketch FASTQ, FASTA, or sourmash signature inputs and report '
+            'cohort-relative k-mer novelty.'
         )
     )
+    parser.add_argument(
+        '--version', action='version', version=f'%(prog)s {__version__}')
 
     # ── Required ──────────────────────────────────────────────────────────────
     req = parser.add_argument_group('Required parameters')
@@ -1501,6 +1612,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help='k-mer size (default: 31)')
     sketch.add_argument('--scaled', type=int, default=10000,
                         help='sourmash scaled parameter (default: 10000)')
+    sketch.add_argument('--seed', type=int, default=42,
+                        help='sourmash hash seed (default: 42)')
     sketch.add_argument('--cache-dir',
                         help='Directory for reusable per-sample sketch caches '
                              '(default: <out-dir>/sketch_cache)')
@@ -1623,6 +1736,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                       help='Verbose progress output')
     misc.add_argument('--threads', type=int, default=4,
                       help='Threads for parallel sample sketching (default: 4)')
+    misc.add_argument('--allow-partial', action='store_true',
+                      help='Continue when one or more samples fail processing')
     misc.add_argument('--multiqc', action='store_true',
                       help='Write MultiQC custom-content JSON')
     misc.add_argument('--ro-crate', action='store_true',
@@ -1636,6 +1751,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error('--ksize must be > 0')
     if args.scaled <= 0:
         parser.error('--scaled must be > 0')
+    if args.seed < 0:
+        parser.error('--seed must be >= 0')
     if args.threads <= 0:
         parser.error('--threads must be > 0')
     if args.map_threads <= 0:
@@ -1656,6 +1773,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error('--write-db-each requires --incremental')
     if args.no_cache and args.cache_dir:
         parser.error('--no-cache cannot be combined with --cache-dir')
+    if args.pair and args.input_type != 'paired-fastq':
+        parser.error('--pair is only supported with --input-type paired-fastq')
     if args.fill_unique and not args.export_unique_shared:
         args.export_unique_shared = True
     if args.input_type == 'signature':
@@ -1672,12 +1791,15 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
 
 def main(argv=None) -> int:
     parser = build_arg_parser()
-    args = parser.parse_args(argv)
+    argv_list = list(argv) if argv is not None else None
+    args = parser.parse_args(argv_list)
     _validate_args(parser, args)
 
     if sourmash is None:
-        parser.error('sourmash Python library is required. '
-                     'Install with: pip install sourmash')
+        detail = f': {SOURMASH_IMPORT_ERROR}' if SOURMASH_IMPORT_ERROR else ''
+        parser.error(
+            'sourmash could not be imported'
+            f'{detail}. Install a compatible sourmash build.')
 
     # ── Logging setup ─────────────────────────────────────────────────────────
     # D1: builtins.print monkey-patch removed; all output goes through the logger
@@ -1732,8 +1854,11 @@ def main(argv=None) -> int:
     # ── Gather samples ────────────────────────────────────────────────────────
     logger.info('Scanning %s (type=%s, substring=%s)',
                 args.input_dir, args.input_type, args.input_substring)
-    gathered = gather_samples_from_dir(
-        args.input_dir, args.input_type, args.input_substring)
+    try:
+        gathered = gather_samples_from_dir(
+            args.input_dir, args.input_type, args.input_substring)
+    except Exception as exc:
+        parser.error(str(exc))
 
     # Merge programmatically supplied --pair triples
     pairs: List[Tuple[str, str, str]] = []
@@ -1743,17 +1868,12 @@ def main(argv=None) -> int:
     for name, r1, r2 in gathered:
         pairs.append((name, r1, r2))
 
-    # For paired mode, drop anything without an R2
-    if args.input_type == 'paired-fastq':
-        before = len(pairs)
-        pairs = [t for t in pairs if t[2]]
-        dropped = before - len(pairs)
-        # R3: log once instead of twice
-        logger.info('Paired mode: dropped %d single(s); using %d paired sample(s)',
-                    dropped, len(pairs))
-
     if not pairs:
         parser.error('No input samples found. Check --input-dir / --pair.')
+    try:
+        validate_sample_inputs(pairs, args.input_type)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     logger.info('GATHERED %d sample(s)', len(pairs))
     for name, r1, r2 in pairs:
@@ -1841,10 +1961,12 @@ def main(argv=None) -> int:
      sample_files,
      sourmash_seq_map,
      profile_agg_counts,
-     profile_samples) = process_samples(
+     profile_samples,
+     failures) = process_samples(
         pairs=pairs,
         ksize=args.ksize,
         scaled=args.scaled,
+        seed=args.seed,
         input_type=args.input_type,
         collect_sequences=args.collect_sequences,
         top_per_sample=args.top_per_sample,
@@ -1859,6 +1981,15 @@ def main(argv=None) -> int:
         logger=logger,
     )
 
+    if failures and not args.allow_partial:
+        logger.error(
+            'Stopping because %d sample(s) failed. Use --allow-partial to '
+            'continue explicitly.', len(failures))
+        return 1
+    if failures:
+        logger.warning(
+            'Continuing with %d successful sample(s); %d failed sample(s)',
+            len(sample_hash_counts), len(failures))
     if not sample_hash_counts:
         logger.error('No samples were successfully processed.')
         return 1
@@ -1872,15 +2003,13 @@ def main(argv=None) -> int:
             out_path=args.top_union_summary if args.top_union_summary else None)
         logger.info('Wrote union summary to %s', union_path)
     except Exception as exc:
-        logger.warning('Failed to write union summary: %s', exc)
+        logger.error('Failed to write union summary: %s', exc)
+        return 1
 
     # ── Per-sample exports ────────────────────────────────────────────────────
     if args.export_kmers_dir and args.full_exports:
         _run_exports(args, sample_hash_counts, sample_files,
                      sourmash_seq_map, top_n, logger)
-    elif args.export_kmers_dir:
-        logger.info('--export-kmers-dir given but --full-exports not set; '
-                    'skipping heavy exports')
 
     # ── Build report rows ─────────────────────────────────────────────────────
     # B7: removed the always-true `'report_rows' in locals()` guard
@@ -2027,11 +2156,22 @@ def main(argv=None) -> int:
 
     manifest_path = os.path.join(out_dir, 'run_manifest.json')
     manifest = {
+        'schema_version': 2,
+        'created_at': datetime.now(timezone.utc).isoformat(),
+        'command': ['outlimer', *(argv_list if argv_list is not None
+                                  else sys.argv[1:])],
+        'software_versions': _runtime_versions(),
         'input_type': args.input_type,
         'ksize': args.ksize,
         'scaled': args.scaled,
+        'seed': args.seed,
         'n_samples': len(sample_hash_counts),
         'samples': sorted(sample_hash_counts),
+        'failed_samples': failures,
+        'input_fingerprints': {
+            name: _source_fingerprint((r1, r2))
+            for name, r1, r2 in pairs
+        },
         'metadata_columns': metadata_columns,
         'cache_dir': None if args.no_cache else args.cache_dir,
         'outputs': {
@@ -2065,6 +2205,8 @@ def main(argv=None) -> int:
                 'input_type': args.input_type,
                 'ksize': args.ksize,
                 'scaled': args.scaled,
+                'seed': args.seed,
+                'outlimer_version': __version__,
                 'n_samples': len(sample_hash_counts),
             },
         )

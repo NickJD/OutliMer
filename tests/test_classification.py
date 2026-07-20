@@ -6,6 +6,7 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 SRC = os.path.join(ROOT, "src")
+DATA = os.path.join(ROOT, "tests", "data")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
@@ -27,6 +28,20 @@ class ClassificationTests(unittest.TestCase):
         combined = classification.combine_scores(scores, scores, scores)
 
         self.assertEqual(combined["anomaly_score"].tolist(), [0.0, 0.0])
+
+        flagged = classification.flag_anomalies(combined, contamination=0.5)
+        self.assertFalse(flagged["is_anomaly"].any())
+
+    def test_anomaly_flags_follow_contamination(self):
+        pd = _require_pandas()
+        ranked = pd.DataFrame(
+            {"anomaly_score": [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]},
+            index=[f"s{i}" for i in range(10)],
+        )
+        flagged = classification.flag_anomalies(ranked, contamination=0.2)
+
+        self.assertEqual(int(flagged["is_anomaly"].sum()), 2)
+        self.assertEqual(flagged.index[flagged["is_anomaly"]].tolist(), ["s0", "s1"])
 
     def test_report_mode_does_not_require_union_csv(self):
         pd = _require_pandas()
@@ -97,6 +112,36 @@ class ClassificationTests(unittest.TestCase):
 
         self.assertEqual(selected, ["s1", "s3"])
 
+    def test_metadata_loader_rejects_duplicate_samples(self):
+        _require_pandas()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "metadata.tsv")
+            with open(path, "w") as fh:
+                fh.write("sample\tstatus\ns1\tcase\ns1\tcontrol\n")
+            with self.assertRaisesRegex(ValueError, "duplicate metadata"):
+                classification.load_sample_metadata(path)
+
+    def test_union_loader_rejects_invalid_matrices(self):
+        _require_pandas()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            negative = os.path.join(tmpdir, "negative.csv")
+            with open(negative, "w") as fh:
+                fh.write("hash,s1\n1,-1\n")
+            with self.assertRaisesRegex(ValueError, "non-negative"):
+                classification.load_union_csv(negative)
+
+            duplicate = os.path.join(tmpdir, "duplicate.csv")
+            with open(duplicate, "w") as fh:
+                fh.write("hash,s1,s1\n1,1,2\n")
+            with self.assertRaisesRegex(ValueError, "duplicate union CSV"):
+                classification.load_union_csv(duplicate)
+
+            malformed = os.path.join(tmpdir, "malformed.csv")
+            with open(malformed, "w") as fh:
+                fh.write("hash,s1\n1,abc\n")
+            with self.assertRaisesRegex(ValueError, "numeric"):
+                classification.load_union_csv(malformed)
+
     def test_compare_union_matrices(self):
         pd = _require_pandas()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -166,6 +211,55 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(int(qc.loc["s1", "unique_hashes"]), 1)
         self.assertAlmostEqual(float(qc.loc["s1", "pct_unique"]), 0.5)
         self.assertAlmostEqual(float(qc.loc["s1", "anomaly_score"]), 0.8)
+
+    def test_feature_matrix_normalises_depth_and_selects_variability(self):
+        pd = _require_pandas()
+        df = pd.DataFrame({
+            "s1": [1000, 10, 0],
+            "s2": [2000, 20, 0],
+            "s3": [1000, 10, 100],
+        }, index=[11, 22, 33])
+
+        _, _, all_log = classification.prepare_feature_matrix(df, top_M=0)
+        selected, _, _ = classification.prepare_feature_matrix(df, top_M=1)
+
+        self.assertAlmostEqual(float(all_log.loc["s1", 11]),
+                               float(all_log.loc["s2", 11]))
+        self.assertEqual(selected.columns.tolist(), [33])
+
+    def test_feature_matrix_rejects_empty_samples(self):
+        pd = _require_pandas()
+        df = pd.DataFrame({"s1": [1, 2], "empty": [0, 0]}, index=[11, 22])
+
+        with self.assertRaisesRegex(ValueError, "empty"):
+            classification.prepare_feature_matrix(df, top_M=0)
+
+    def test_mean_jaccard_excludes_self_distance(self):
+        pd = _require_pandas()
+        binary = pd.DataFrame({1: [1, 0], 2: [0, 1]}, index=["s1", "s2"])
+
+        mean = classification.compute_mean_jaccard_distance(binary)
+
+        self.assertEqual(mean.to_dict(), {"s1": 1.0, "s2": 1.0})
+
+    def test_truth_fixture_separates_composition_from_depth(self):
+        _require_pandas()
+        df = classification.load_union_csv(
+            os.path.join(DATA, "classifier_truth.csv")
+        )
+        _, binary, normalised = classification.prepare_feature_matrix(df, top_M=0)
+        combined = classification.flag_anomalies(
+            classification.combine_scores(
+                classification.compute_mean_jaccard_distance(binary),
+                classification.compute_isolation_forest(normalised, 0.1),
+                classification.compute_lof(normalised, 0.1),
+            ),
+            contamination=0.1,
+        )
+
+        self.assertEqual(combined.index[0], "composition_outlier")
+        self.assertTrue(bool(combined.loc["composition_outlier", "is_anomaly"]))
+        self.assertFalse(bool(combined.loc["depth_control", "is_anomaly"]))
 
     def test_diagnostic_plot_writers_when_dependencies_available(self):
         required = ["matplotlib", "seaborn", "sklearn", "scipy"]

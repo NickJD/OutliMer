@@ -1,16 +1,18 @@
 # OutliMer
 
-OutliMer detects outlier genomic or metagenomic samples from sourmash MinHash
+OutliMer ranks unusual genomic or metagenomic samples from sourmash MinHash
 k-mer sketches. It scans FASTQ or FASTA inputs, builds per-sample hash
 abundance profiles, compares samples against either a supplied hash database or
-the rest of the cohort, and writes reports for unusual samples and their
-contributing hashes.
+the rest of the cohort, and writes exploratory reports for unusual samples and
+their contributing hashes.
 
-The project currently provides two command line tools:
+The project provides three command line tools:
 
 - `outlimer`: sketch input sequence files and write hash/count outputs.
 - `outlimer-classify`: run downstream anomaly scoring from an OutliMer union
   matrix or per-sample report.
+- `outlimer-profile`: build, update, describe, and compare reusable hash
+  profiles.
 
 ## Installation
 
@@ -26,7 +28,9 @@ For development:
 python -m pip install -e ".[dev]"
 ```
 
-OutliMer requires Python 3.10 or later.
+OutliMer supports Python 3.11 through 3.13.
+
+All commands expose their installed version with `--version`.
 
 ## Quick Start
 
@@ -48,6 +52,11 @@ outlimer \
   --input-type signature \
   --out-dir outlimer_results
 ```
+
+Signature files must contain exactly one DNA abundance signature at the
+requested k-mer size and hash seed. Denser signatures are downsampled to
+`--scaled`; signatures that are already sparser cannot be upsampled and are
+rejected.
 
 Include sample metadata in reports:
 
@@ -94,8 +103,8 @@ outlimer-classify \
 - `kmer_report.csv`: per-sample hash totals, hashes shared with the comparison
   database or cohort, and hashes new to the sample.
 - `export_kmers/top_union_summary.csv`: a wide hash-by-sample count matrix.
-- `run_manifest.json`: run parameters, sample list, cache path, and primary
-  output paths.
+- `run_manifest.json`: command line, software versions, parameters, sample
+  fingerprints, failures, cache path, and primary output paths.
 - Optional plot PNGs when `--plot` is supplied.
 - Optional per-sample unique/shared hash exports when `--full-exports` and
   `--export-unique-shared` are supplied.
@@ -106,7 +115,9 @@ outlimer-classify \
 
 - `outliers_report.csv`: combined anomaly scores from Jaccard distance,
   Isolation Forest, and Local Outlier Factor.
-- `top_anomalies.csv`: the top 5 percent of samples by anomaly score.
+- `top_anomalies.csv`: samples flagged from the fraction requested by
+  `--contamination`; it is empty when the cohort contains no non-zero anomaly
+  signal.
 - `explanations_by_sample.csv` and `.json`: top contributing hashes and short
   explanations.
 - `hash_enrichment.csv`: Fisher exact enrichment of hashes in a foreground set
@@ -125,15 +136,18 @@ outlimer-classify \
 ## Caching
 
 By default, sketches are cached under `<out-dir>/sketch_cache`. The cache key
-includes input file path, size, mtime, k-mer size, scaled value, and input type.
+includes input file path, size, mtime, k-mer size, scaled value, hash seed, and
+input type.
 Use `--no-cache` to force recomputation or `--cache-dir` to share a cache across
 runs.
 
-## Workflow Examples
+## Input Validation
 
-Minimal Snakemake and Nextflow examples live under `workflows/`. They are
-templates intended to be copied into analysis projects and adapted for local
-resources, conda/container setup, and metadata conventions.
+Paired FASTQ discovery rejects orphaned or duplicate mates. FASTQ and FASTA
+records are validated before sketching. By default, any failed sample stops the
+run so a silently reduced cohort cannot be mistaken for a complete analysis.
+Use `--allow-partial` only when a partial result is intentional; failed sample
+names and errors are recorded in `run_manifest.json`.
 
 ## Profile Utilities
 
@@ -168,6 +182,26 @@ python -m ruff check .
 ```
 
 The tests use small synthetic data and do not require real sequencing files.
+One dependency-gated integration test runs the complete toy workflow with the
+real sourmash implementation. See `docs/TEST_DATASETS.md` for the fixture and
+larger validation-data plan.
+
+The bundled toy FASTA files are deliberately short. Use `--ksize 5 --scaled 1`
+when running them through the real sketching workflow.
+
+## Interpretation And Limitations
+
+`anomaly_score` is a cohort-relative exploratory ranking, not a probability,
+diagnosis, or calibrated p-value. Scores should not be compared directly
+between independently processed cohorts. Count-based models use per-sample
+depth-normalised features; Jaccard uses hash presence/absence. Review the QC
+plots, sample depth, metadata, and contributing hashes before treating a ranked
+sample as a biological outlier.
+
+Hash enrichment p-values are corrected for multiple testing, but meaningful
+group-level enrichment requires adequate foreground and background sample
+sizes. The automatic foreground is intended for exploration; planned analyses
+should select groups explicitly through sample names or metadata queries.
 
 For a maintainer-oriented summary of the packaging, CLI, testing, workflow, and
 release changes made during the cleanup pass, see `docs/CHANGE_GUIDE.md`.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import html
 import inspect
 import json
@@ -9,6 +10,8 @@ import os
 import sys
 from datetime import datetime, timezone
 from typing import Any, Iterable, Sequence
+
+from OutliMer import __version__
 
 
 def _load_pandas_numpy():
@@ -98,7 +101,13 @@ def load_sample_metadata(path: str, sample_column: str = "sample"):
     df = pd.read_csv(path, sep=delimiter, dtype=str).fillna("")
     if sample_column not in df.columns:
         raise ValueError(f"metadata sample column {sample_column!r} not found")
-    df = df.drop_duplicates(subset=[sample_column], keep="last")
+    if df[sample_column].eq("").any():
+        raise ValueError("metadata contains a blank sample name")
+    duplicated = df.loc[df[sample_column].duplicated(), sample_column].tolist()
+    if duplicated:
+        raise ValueError(
+            "duplicate metadata sample(s): " + ", ".join(sorted(set(duplicated)))
+        )
     df = df.set_index(sample_column)
     return df
 
@@ -123,14 +132,46 @@ def select_samples_by_query(metadata: Any, query: str) -> list[str]:
 
 def load_union_csv(path: str) -> Any:
     """Load a top-union summary CSV as rows=hashes, columns=samples."""
-    pd, _ = _load_pandas_numpy()
+    pd, np = _load_pandas_numpy()
     if not path or not os.path.exists(path):
         raise FileNotFoundError(path)
+    with open(path, newline="") as fh:
+        header = next(csv.reader(fh), [])
+    if len(header) < 2:
+        raise ValueError("union CSV must contain a hash column and at least one sample")
+    duplicates = sorted({name for name in header if header.count(name) > 1})
+    if duplicates:
+        raise ValueError("duplicate union CSV column(s): " + ", ".join(duplicates))
+    if any(not str(name).strip() for name in header):
+        raise ValueError("union CSV contains a blank column name")
+
     df = pd.read_csv(path, index_col=0)
     for column in ("sequence", "total_count"):
         if column in df.columns:
             df = df.drop(columns=[column])
-    return df.fillna(0).apply(pd.to_numeric, errors="coerce").fillna(0)
+    if df.shape[1] == 0:
+        raise ValueError("union CSV contains no sample columns")
+    hash_values = pd.to_numeric(df.index, errors="coerce")
+    if bool(pd.isna(hash_values).any()):
+        raise ValueError("union CSV hash identifiers must be integers")
+    if not np.equal(hash_values, np.floor(hash_values)).all():
+        raise ValueError("union CSV hash identifiers must be integers")
+    int_hashes = [int(value) for value in hash_values]
+    if len(set(int_hashes)) != len(int_hashes):
+        raise ValueError("union CSV contains duplicate hash identifiers")
+
+    numeric = df.apply(pd.to_numeric, errors="coerce")
+    if bool(numeric.isna().any().any()):
+        raise ValueError("union CSV counts must be numeric and non-missing")
+    values = numeric.to_numpy(dtype=float)
+    if not np.isfinite(values).all():
+        raise ValueError("union CSV counts must be finite")
+    if (values < 0).any():
+        raise ValueError("union CSV counts must be non-negative")
+    if not np.equal(values, np.floor(values)).all():
+        raise ValueError("union CSV counts must be integers")
+    numeric.index = int_hashes
+    return numeric.astype(int)
 
 
 def load_report_csv(path: str) -> Any:
@@ -205,7 +246,7 @@ def explain_report_based(report_df: Any) -> Any:
 
 
 def prepare_feature_matrix(df: Any, top_M: int = 2000, min_samples: int = 1):
-    """Return raw, binary, and log1p sample-by-hash feature matrices."""
+    """Return raw, binary, and depth-normalised sample-by-hash matrices."""
     _, np = _load_pandas_numpy()
     if min_samples < 1:
         raise ValueError("--min-samples must be >= 1")
@@ -215,11 +256,24 @@ def prepare_feature_matrix(df: Any, top_M: int = 2000, min_samples: int = 1):
     X = df.T.astype(float).fillna(0)
     prevalence = X.gt(0).sum(axis=0)
     X = X.loc[:, prevalence >= min_samples]
+    if X.shape[1] == 0:
+        raise ValueError("no hash features remain after prevalence filtering")
+    sample_totals_raw = X.sum(axis=1)
+    empty_samples = sample_totals_raw.index[sample_totals_raw <= 0].tolist()
+    if empty_samples:
+        raise ValueError(
+            "samples contain no retained hash counts: "
+            + ", ".join(str(sample) for sample in empty_samples)
+        )
+    sample_totals = sample_totals_raw.replace(0, np.nan)
+    relative = X.div(sample_totals, axis=0).fillna(0.0)
+    X_log = np.log1p(relative * 1_000_000.0)
     if top_M and X.shape[1] > top_M:
-        totals = X.sum(axis=0)
-        X = X.loc[:, totals.sort_values(ascending=False).head(top_M).index]
+        variability = X_log.var(axis=0)
+        selected = variability.sort_values(ascending=False).head(top_M).index
+        X = X.loc[:, selected]
+        X_log = X_log.loc[:, selected]
     X_binary = (X > 0).astype(int)
-    X_log = np.log1p(X)
     return X, X_binary, X_log
 
 
@@ -327,9 +381,15 @@ def compute_mean_jaccard_distance(X_binary: Any) -> Any:
     """Compute mean pairwise Jaccard distance without requiring scipy."""
     pd, _ = _load_pandas_numpy()
     distances = compute_jaccard_distance_matrix(X_binary)
-    if distances.empty:
+    n_samples = distances.shape[0]
+    if n_samples == 0:
         return pd.Series([], index=X_binary.index, dtype=float)
-    return pd.Series(distances.values.mean(axis=1), index=X_binary.index)
+    if n_samples == 1:
+        return pd.Series([0.0], index=X_binary.index, dtype=float)
+    return pd.Series(
+        distances.values.sum(axis=1) / (n_samples - 1),
+        index=X_binary.index,
+    )
 
 
 def compute_sample_qc_metrics(df: Any, ranked: Any | None = None) -> Any:
@@ -684,30 +744,56 @@ def compute_enrichment_plot(enrichment_df: Any, out_path: str) -> None:
 
 
 def combine_scores(mean_dist: Any, if_scores: Any, lof_scores: Any) -> Any:
-    pd, _ = _load_pandas_numpy()
+    pd, np = _load_pandas_numpy()
     df = pd.DataFrame({
         "mean_jaccard": mean_dist,
         "isolation_forest": if_scores,
         "lof": lof_scores,
     })
+    df.index.name = "sample"
     if df.empty:
         df["combined_rank"] = []
         df["combined_score"] = []
         df["anomaly_score"] = []
         return df
 
-    ranks = df.rank(ascending=False)
-    df["combined_rank"] = ranks.mean(axis=1)
-    rank_span = float(df["combined_rank"].max() - df["combined_rank"].min())
-    if rank_span <= 1e-12:
+    components = []
+    for column in ("mean_jaccard", "isolation_forest", "lof"):
+        values = df[column].astype(float)
+        span = float(values.max() - values.min())
+        reference = max(1.0, abs(float(np.median(values))))
+        if span <= max(1e-12, reference * 1e-3):
+            components.append(values * 0.0)
+        else:
+            components.append((values - values.min()) / span)
+
+    raw = pd.concat(components, axis=1).mean(axis=1)
+    raw_span = float(raw.max() - raw.min())
+    if raw_span <= 1e-12:
         df["combined_score"] = 0.0
         df["anomaly_score"] = 0.0
     else:
-        df["combined_score"] = (
-            (df["combined_rank"] - df["combined_rank"].min()) / rank_span
-        )
-        df["anomaly_score"] = 1.0 - df["combined_score"]
+        df["anomaly_score"] = (raw - raw.min()) / raw_span
+        df["combined_score"] = 1.0 - df["anomaly_score"]
+    df["combined_rank"] = df["anomaly_score"].rank(
+        ascending=False, method="average"
+    )
     return df.sort_values("anomaly_score", ascending=False)
+
+
+def flag_anomalies(ranked: Any, contamination: float) -> Any:
+    """Flag the requested top fraction when the cohort has non-zero signal."""
+    _validate_contamination(contamination)
+    out = ranked.sort_values("anomaly_score", ascending=False).copy()
+    out["rank"] = range(1, len(out) + 1)
+    out["is_anomaly"] = False
+    if out.empty or float(out["anomaly_score"].max()) <= 0.0:
+        return out
+    n_candidates = max(1, int(math.ceil(contamination * len(out))))
+    candidates = out.head(n_candidates)
+    candidates = candidates.loc[candidates["anomaly_score"] > 0.0]
+    out.loc[candidates.index, "is_anomaly"] = True
+    return out
 
 
 def top_contributing_hashes(df: Any, sample: str, top_n: int = 10) -> list[dict[str, Any]]:
@@ -920,6 +1006,7 @@ def write_ro_crate(
             "@type": "Dataset",
             "name": name,
             "dateCreated": datetime.now(timezone.utc).isoformat(),
+            "softwareVersion": __version__,
             "hasPart": [{"@id": os.path.basename(path)}
                         for path in list(inputs.values()) + list(outputs.values())
                         if path],
@@ -1103,6 +1190,9 @@ def _default_report_path(out_dir: str, report_csv: str | None) -> str:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Classify OutliMer k-mer hash matrices and reports."
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
     )
     parser.add_argument(
         "--union-csv",
@@ -1331,7 +1421,11 @@ def main(argv: Iterable[str] | None = None) -> int:
                 contamination=args.contamination,
             )
             lof_scores = compute_lof(X_log, contamination=args.contamination)
-            combined = combine_scores(mean_dist, if_scores, lof_scores)
+            combined = flag_anomalies(
+                combine_scores(mean_dist, if_scores, lof_scores),
+                args.contamination,
+            )
+            model_df = df.loc[X.columns]
             if not args.no_plots:
                 qc_metrics = compute_sample_qc_metrics(df, combined)
                 pca_path = os.path.join(args.out_dir, "pca_samples.png")
@@ -1370,7 +1464,7 @@ def main(argv: Iterable[str] | None = None) -> int:
 
                 driver_path = os.path.join(args.out_dir, "driver_hash_heatmap.png")
                 compute_driver_hash_heatmap(
-                    df,
+                    model_df,
                     combined,
                     driver_path,
                     top_hashes=args.plot_top_hashes,
@@ -1399,16 +1493,17 @@ def main(argv: Iterable[str] | None = None) -> int:
         print(f"Wrote outlier report to {out_report}")
         links["Outlier report CSV"] = out_report
 
-        topn = max(1, int(math.ceil(0.05 * combined.shape[0]))) if not combined.empty else 0
+        flagged = combined.loc[combined["is_anomaly"]].copy()
+        topn = int(flagged.shape[0])
         topn_path = os.path.join(args.out_dir, "top_anomalies.csv")
-        combined.head(topn).to_csv(topn_path)
-        print(f"Wrote top {topn} anomalies to {topn_path}")
+        flagged.to_csv(topn_path)
+        print(f"Wrote {topn} flagged anomalies to {topn_path}")
         links["Top anomalies CSV"] = topn_path
 
         explain_outdir = args.explain_output or args.out_dir
         try:
             expl_path = write_explanations(
-                df,
+                model_df,
                 combined,
                 explain_outdir,
                 top_n=args.explain_top_n,
@@ -1428,7 +1523,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             if args.background_query:
                 background = select_samples_by_query(metadata, args.background_query)
             if foreground is None:
-                foreground = combined.head(topn).index.tolist()
+                foreground = flagged.index.tolist()
             if background is None:
                 background = sorted(available - set(foreground))
             if foreground and background:
@@ -1463,11 +1558,12 @@ def main(argv: Iterable[str] | None = None) -> int:
                 {
                     "mode": "union",
                     "samples": combined.shape[0],
-                    "features": df.shape[0],
-                    "top anomalies": topn,
+                    "features used for scoring": model_df.shape[0],
+                    "flagged anomalies": topn,
                 },
                 {
-                    "Top anomalies": combined.head(max(topn, 1)),
+                    "Flagged anomalies": flagged,
+                    "Ranked samples": combined.head(25),
                 },
                 links,
             )

@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use OutliMer, please cite the software release used in your analysis."
+type: software
+title: "OutliMer"
+abstract: "A command-line toolkit for cohort-relative k-mer anomaly ranking in genomic and metagenomic samples."
+authors:
+  - family-names: "Dimonaco"
+    given-names: "Nicholas"
+version: "0.1.0"
+license: "GPL-3.0-only"
+repository-code: "https://github.com/NickJD/OutliMer"
+url: "https://github.com/NickJD/OutliMer"

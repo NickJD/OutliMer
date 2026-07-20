@@ -13,9 +13,9 @@ The work had four main goals:
   generated analysis outputs.
 - Stabilize the command line behavior and fix known logic errors.
 - Add the next practical extensions for bioinformatics users: metadata,
-  sourmash signature input, caching, HTML reports, workflow examples, tests,
-  release automation, MultiQC output, RO-Crate metadata, profile utilities,
-  run comparison, and sparse feature export.
+  sourmash signature input, caching, HTML reports, tests, MultiQC output,
+  RO-Crate metadata, profile utilities, run comparison, and sparse feature
+  export.
 
 ## Repository Layout
 
@@ -23,20 +23,19 @@ The project now uses a cleaner `src/` layout:
 
 ```text
 .
-├── .github/workflows/
-│   ├── ci.yml
-│   └── release.yml
+├── CHANGELOG.md
+├── CITATION.cff
+├── CONTRIBUTING.md
 ├── docs/
-│   └── CHANGE_GUIDE.md
-├── packaging/bioconda/
-│   └── meta.yaml
+│   ├── CHANGE_GUIDE.md
+│   └── TEST_DATASETS.md
 ├── src/OutliMer/
 │   ├── __init__.py
 │   ├── OutliMer.py
 │   ├── classification.py
 │   └── profiles.py
 ├── tests/
-├── workflows/
+│   └── data/
 ├── MANIFEST.in
 ├── README.md
 └── pyproject.toml
@@ -372,67 +371,11 @@ These operate on the existing profile layout:
 - `agg_counts.csv`
 - `samples.txt`
 
-## Workflow Examples
-
-Minimal workflow templates were added:
-
-- `workflows/snakemake/Snakefile`
-- `workflows/snakemake/config.yaml`
-- `workflows/nextflow/main.nf`
-
-These run the two-step workflow:
-
-1. `outlimer`
-2. `outlimer-classify`
-
-They are intentionally small and should be copied into analysis repositories
-before adding cluster resources, containers, conda environments, or project
-specific metadata rules.
-
 ## Toy Dataset
 
 A tiny example dataset was added under `examples/toy/`. It contains short FASTA
 sequences and a small `samples.tsv`. It is intended for smoke tests and docs,
 not biological benchmarking.
-
-## Release Automation
-
-Two GitHub Actions workflows were added.
-
-### CI
-
-`.github/workflows/ci.yml` runs on pushes and pull requests:
-
-- installs the package with development dependencies
-- runs tests
-- runs Ruff
-- builds wheel and sdist
-
-### PyPI Release
-
-`.github/workflows/release.yml` builds distributions and publishes to PyPI when
-a GitHub release is published.
-
-It uses PyPI Trusted Publishing via OIDC, so the repository does not need a
-long-lived PyPI API token. Before the first release, configure the PyPI project
-to trust this GitHub repository and workflow.
-
-## Bioconda Preparation
-
-A draft recipe was added:
-
-```text
-packaging/bioconda/meta.yaml
-```
-
-After publishing a PyPI sdist, fill in:
-
-- the final version
-- the PyPI sdist SHA256
-
-Then submit the recipe to `bioconda-recipes`.
-
-The package is pure Python and the draft recipe uses `noarch: python`.
 
 ## Tests Added
 
@@ -473,8 +416,9 @@ python -m unittest discover -s tests -v
 python -m pip wheel . --no-deps --no-build-isolation
 ```
 
-The test suite passed with 19 tests, with one expected skip when SciPy was not
-available in the bundled test runtime.
+The test suite covers core parsing, compatibility, scoring, plotting,
+provenance, package metadata, and profile operations. Dependency-gated tests
+skip only when their real runtime dependency cannot be imported.
 
 The wheel build passed and the wheel contents were inspected. The wheel contains
 only:
@@ -486,7 +430,7 @@ only:
 - package metadata
 - license metadata
 
-Generated outputs and workflow templates are not included in the wheel payload.
+Generated outputs and test data are not included in the wheel payload.
 
 After approval for network access, runtime dependencies were installed into
 `/private/tmp/outlimer_runtime_deps` and a real toy workflow was run with
@@ -537,14 +481,43 @@ still needs to run in CI or a clean release environment with:
 python -m pip install -e ".[dev]"
 ```
 
-Sourmash signature input is still unit-tested with a fake sourmash loader. A
-real `.sig` integration fixture should be added before the first public release.
+The toy FASTA integration is now part of the test suite and uses real sourmash
+when it is importable. A real `.sig` integration fixture remains a release
+check; unit fixtures cover scale, multiplicity, seed, molecule type, and
+abundance validation.
+
+## Publication Hardening
+
+The release-preparation pass added strict four-line FASTQ and FASTA validation,
+duplicate/orphan mate detection, duplicate metadata detection, fatal sample
+failure by default, and `--allow-partial` for intentional partial cohorts.
+Core output failures are fatal rather than warning-only.
+
+Signature input now requires one DNA abundance signature with compatible
+`ksize`, seed, and scale. Denser signatures are downsampled to the requested
+scale; sparse signatures are never presented as though they had been
+upsampled.
+
+Classification matrices now reject duplicate columns and hashes, missing or
+non-numeric values, fractional counts, and negative counts. Count-based models
+use depth-normalised features selected by variability. Mean Jaccard excludes
+self-distance, effectively constant detector components do not dominate the
+combined score, and explanations use only hashes retained for scoring.
+
+`--contamination` now controls the flagged fraction. A zero-signal tied cohort
+writes an empty `top_anomalies.csv` rather than labeling an arbitrary sample.
+Scores remain cohort-relative exploratory ranks and are not probabilities.
+
+Package versioning is single-sourced from `OutliMer.__version__`; all commands
+support `--version`. Run manifests include the command, UTC timestamp, package
+and dependency versions, input file fingerprints, hash seed, and failed sample
+details. The supported interpreter range is Python 3.11 through 3.13.
 
 ## Suggested Next Checks
 
 Before publishing:
 
-1. Create a fresh virtual environment with Python 3.10, 3.11, and 3.12.
+1. Create fresh virtual environments with Python 3.11, 3.12, and 3.13.
 2. Install with `python -m pip install -e ".[dev]"`.
 3. Run `python -m pytest`.
 4. Run a tiny real FASTQ end-to-end workflow.
